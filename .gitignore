@@ -1,0 +1,38 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.env
+.venv/
+venv/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Project outputs =====
+runs/
+outputs/
+cache/
+
+# ===== Large data / media =====
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# ===== Generated data =====
+*.csv
+*.npy
+*.pt
+*.pth
+
+# ===== Logs =====
+*.log
+logs/
+
+# ===== IDE =====
+.vscode/
+.idea/

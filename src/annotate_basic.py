@@ -1,0 +1,455 @@
+# annotate_basic.py
+import json
+from pathlib import Path
+from collections import deque
+import re
+
+import cv2
+import numpy as np
+import pandas as pd
+
+
+NAMED_CONNECTIONS = [
+    ("left_shoulder","left_elbow"),
+    ("left_elbow","left_wrist"),
+    ("right_shoulder","right_elbow"),
+    ("right_elbow","right_wrist"),
+    ("left_shoulder","right_shoulder"),
+    ("left_shoulder","left_hip"),
+    ("right_shoulder","right_hip"),
+    ("left_hip","right_hip"),
+    ("left_hip","left_knee"),
+    ("left_knee","left_ankle"),
+    ("left_ankle","left_foot_index"),
+    ("right_hip","right_knee"),
+    ("right_knee","right_ankle"),
+    ("right_ankle","right_foot_index"),
+]
+
+
+def _discover_keypoints_columns(df: pd.DataFrame):
+    """
+    Try to discover keypoint columns in clip.csv robustly.
+    Expected patterns:
+      - kp{idx}_x, kp{idx}_y (and optional kp{idx}_v / kp{idx}_score)
+      - landmark_{idx}_x, landmark_{idx}_y
+      - pose_{idx}_x, pose_{idx}_y
+    Returns:
+      - a list of tuples: [(idx, x_col, y_col, conf_col_or_None), ...] sorted by idx
+    """
+    patterns = [
+        (re.compile(r"^kp(\d+)_x$"), "kp"),
+        (re.compile(r"^landmark_(\d+)_x$"), "landmark"),
+        (re.compile(r"^pose_(\d+)_x$"), "pose"),
+    ]
+
+    cols = set(df.columns)
+    found = []
+
+    for rx, _tag in patterns:
+        for c in df.columns:
+            m = rx.match(c)
+            if not m:
+                continue
+            idx = int(m.group(1))
+            x_col = c
+            # infer y col
+            y_col = x_col.replace("_x", "_y")
+            if y_col not in cols:
+                continue
+            # optional confidence columns
+            conf_candidates = [
+                x_col.replace("_x", "_v"),
+                x_col.replace("_x", "_vis"),
+                x_col.replace("_x", "_score"),
+                x_col.replace("_x", "_conf"),
+            ]
+            conf_col = next((cc for cc in conf_candidates if cc in cols), None)
+            found.append((idx, x_col, y_col, conf_col))
+
+        if found:
+            break
+
+    found.sort(key=lambda t: t[0])
+    return found
+
+
+def _discover_ball_columns(df: pd.DataFrame):
+    """
+    Discover ball columns. Common possibilities:
+      - ball_x, ball_y, ball_conf
+      - ball_center_x, ball_center_y, ball_score
+      - x_ball, y_ball
+    """
+    cols = set(df.columns)
+
+    candidates = [
+        ("ball_x", "ball_y", "ball_conf"),
+        ("ball_x", "ball_y", "ball_score"),
+        ("ball_center_x", "ball_center_y", "ball_conf"),
+        ("ball_center_x", "ball_center_y", "ball_score"),
+        ("x_ball", "y_ball", "ball_conf"),
+        ("x_ball", "y_ball", "ball_score"),
+        ("ball_cx", "ball_cy", "ball_conf"),
+    ]
+    for x, y, c in candidates:
+        if x in cols and y in cols:
+            conf = c if c in cols else None
+            return x, y, conf
+
+    # fallback: find any pair containing 'ball' and ending with x/y
+    x_like = [c for c in df.columns if "ball" in c.lower() and c.lower().endswith(("x", "_x"))]
+    for x_col in x_like:
+        y_col = x_col[:-1] + "y"
+        if y_col in cols:
+            return x_col, y_col, None
+
+    return None, None, None
+
+def draw_bracket_between_points(img, p1, p2, offset=14, tick=10, thickness=2):
+    """
+    Draw a simple bracket-like marker between two points.
+    p1, p2: (x, y) in pixel coords
+    offset: how far the bracket is away from the segment
+    tick: length of the small perpendicular ticks at both ends
+    """
+    import numpy as np
+    import cv2
+
+    x1, y1 = int(p1[0]), int(p1[1])
+    x2, y2 = int(p2[0]), int(p2[1])
+
+    # segment direction
+    vx, vy = x2 - x1, y2 - y1
+    norm = (vx * vx + vy * vy) ** 0.5
+    if norm < 1e-6:
+        return
+
+    # unit normal (perpendicular)
+    nx, ny = -vy / norm, vx / norm
+
+    # shift the main bracket line away from the segment
+    sx1, sy1 = int(x1 + nx * offset), int(y1 + ny * offset)
+    sx2, sy2 = int(x2 + nx * offset), int(y2 + ny * offset)
+
+    # main line
+    cv2.line(img, (sx1, sy1), (sx2, sy2), (255, 255, 255), thickness)
+
+    # ticks at ends (pointing toward the original segment)
+    tx1, ty1 = int(sx1 - nx * tick), int(sy1 - ny * tick)
+    tx2, ty2 = int(sx2 - nx * tick), int(sy2 - ny * tick)
+
+    cv2.line(img, (sx1, sy1), (tx1, ty1), (255, 255, 255), thickness)
+    cv2.line(img, (sx2, sy2), (tx2, ty2), (255, 255, 255), thickness)
+
+def discover_named_points(df):
+    names = [
+        "left_shoulder","right_shoulder",
+        "left_elbow","right_elbow",
+        "left_wrist","right_wrist",
+        "left_hip","right_hip",
+        "left_knee","right_knee",
+        "left_ankle","right_ankle",
+        "left_foot_index","right_foot_index",
+    ]
+    pts = {}
+    for n in names:
+        x = f"{n}_x"
+        y = f"{n}_y"
+        if x in df.columns and y in df.columns:
+            pts[n] = (x, y)
+    return pts
+
+def annotate_one_throw(
+    throw_dir: Path,
+    df_clip: pd.DataFrame,
+    clip_mp4: Path,
+    start_frame: int,
+    release_frame: int,
+    end_frame: int,
+    throw_id: int,
+    score_obj: dict | None = None,
+    trail_len: int = 10,
+    kp_conf_th: float = 0.10,
+    ball_conf_th: float = 0.10,
+):
+
+    out_path = throw_dir / "annotated.mp4"
+
+    cap = cv2.VideoCapture(str(clip_mp4))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open clip video: {clip_mp4}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps if fps > 0 else 30.0, (w, h))
+
+    # Discover schema
+    named_pts = discover_named_points(df_clip)   # <-- NEW: your named keypoints
+    bx, by, bc = _discover_ball_columns(df_clip)
+
+
+    # Use frame matching if available
+    has_frame_col = "frame" in df_clip.columns
+    # Build quick lookup from frame->row index
+    if has_frame_col:
+        frame_to_idx = {int(f): i for i, f in enumerate(df_clip["frame"].values)}
+    else:
+        frame_to_idx = None
+
+    ball_trail = deque(maxlen=trail_len)
+
+    frame_idx_in_video = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        # Determine "global frame" for phase labeling:
+        # Prefer df_clip["frame"] if present; else approximate by start_frame + local index.
+        if has_frame_col:
+            # if local index aligns with df rows, use local row’s frame
+            # We will try to map via local order: take df row at frame_idx_in_video if exists
+            if frame_idx_in_video < len(df_clip):
+                global_f = int(df_clip.iloc[frame_idx_in_video]["frame"])
+            else:
+                global_f = int(start_frame + frame_idx_in_video)
+        else:
+            global_f = int(start_frame + frame_idx_in_video)
+
+        # Find row data
+        if has_frame_col and frame_to_idx is not None and global_f in frame_to_idx:
+            row = df_clip.iloc[frame_to_idx[global_f]]
+        elif frame_idx_in_video < len(df_clip):
+            row = df_clip.iloc[frame_idx_in_video]
+        else:
+            row = None
+
+        # Overlay header text
+        t_sec = frame_idx_in_video / (fps if fps and fps > 0 else 30.0)
+        header = f"throw_{throw_id:03d} | local_frame={frame_idx_in_video:04d} | t={t_sec:6.2f}s"
+        # Info panel (top-right)
+        panel_w = 520
+        panel_h = 60
+        x0 = max(0, w - panel_w - 16)
+        y0 = 12
+
+        cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), (0, 0, 0), -1)
+
+        line1 = f"throw_{throw_id:03d}"
+        line2 = f"local_frame={frame_idx_in_video:04d}  t={t_sec:6.2f}s"
+
+        cv2.putText(frame, line1, (x0 + 12, y0 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, line2, (x0 + 12, y0 + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Overlay header text
+        t_sec = frame_idx_in_video / (fps if fps and fps > 0 else 30.0)
+        header = f"throw_{throw_id:03d} | local_frame={frame_idx_in_video:04d} | t={t_sec:6.2f}s"
+        cv2.putText(frame, header, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # DTW summary (minimal, text-only)
+        if score_obj is not None:
+            try:
+                dtw = score_obj.get("dtw", {})
+                feats = dtw.get("features", {}) or {}
+                overall = dtw.get("overall_matching_score", None)
+
+                angle_feats = {"elbow_angle", "shoulder_angle", "hip_angle"}
+
+                # Rank "most off" by normalized severity (angle/180, others are already 0..1)
+                ranked = []
+                for k, v in feats.items():
+                    if v is None:
+                        continue
+                    try:
+                        fv = float(v["value"]) if isinstance(v, dict) else float(v)
+                    except Exception:
+                        continue
+                    sev = (fv / 180.0) if k in angle_feats else fv
+                    ranked.append((sev, k, fv))
+                ranked.sort(reverse=True)
+
+                lines = []
+                if overall is not None:
+                    try:
+                        ov = float(overall)
+                        lines.append(f"DTW overall: {ov*100:.1f}%")
+                    except Exception:
+                        pass
+
+                # show top-3 largest deviations
+                for sev, k, fv in ranked[:3]:
+                    if k in angle_feats:
+                        lines.append(f"{k}: {fv:.1f} deg")
+                    else:
+                        lines.append(f"{k}: {fv*100:.1f}%")
+
+                y0 = 52
+                for i, s in enumerate(lines):
+                    cv2.putText(frame, s, (16, y0 + 22*i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            except Exception:
+                pass
+
+        # Phase markers
+        phase = None
+        if global_f == start_frame:
+            phase = "START"
+        elif global_f == release_frame:
+            phase = "RELEASE"
+        elif global_f == end_frame:
+            phase = "END"
+
+        if phase is not None:
+            # Top bar (thin) + small label
+            bar_h = 8
+            cv2.rectangle(frame, (0, 0), (w, bar_h), (255, 255, 255), -1)
+            cv2.putText(frame, phase, (16, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+
+        # Draw skeleton (named keypoints) - draw for all frames
+        if row is not None and named_pts:
+            pts = {}
+            # draw points
+            for name, (x_col, y_col) in named_pts.items():
+                x = row.get(x_col, np.nan)
+                y = row.get(y_col, np.nan)
+                if pd.isna(x) or pd.isna(y):
+                    continue
+                px = int(float(x))
+                py = int(float(y))
+                pts[name] = (px, py)
+                cv2.circle(frame, (px, py), 3, (255, 255, 255), -1)
+
+            # draw connections
+            for a, b in NAMED_CONNECTIONS:
+                if a in pts and b in pts:
+                    cv2.line(frame, pts[a], pts[b], (255, 255, 255), 1)
+
+                # ===== DTW-driven bracket: feet_lr_dist =====
+        if row is not None and score_obj is not None and named_pts:
+            try:
+                feat = score_obj.get("dtw", {}).get("features", {}).get("feet_lr_dist", None)
+                # feat is expected to be a dict like: {"value":..., "level":...}
+                if isinstance(feat, dict) and feat.get("level", "ok") != "ok":
+                    # Use ankles for stability
+                    if "left_ankle" in named_pts and "right_ankle" in named_pts:
+                        lx_col, ly_col = named_pts["left_ankle"]
+                        rx_col, ry_col = named_pts["right_ankle"]
+
+                        lx, ly = row.get(lx_col, np.nan), row.get(ly_col, np.nan)
+                        rx, ry = row.get(rx_col, np.nan), row.get(ry_col, np.nan)
+
+                        if not pd.isna(lx) and not pd.isna(ly) and not pd.isna(rx) and not pd.isna(ry):
+                            pL = (float(lx), float(ly))
+                            pR = (float(rx), float(ry))
+                            draw_bracket_between_points(frame, pL, pR, offset=16, tick=10, thickness=2)
+
+                            # Optional label: show feet_lr_dist value
+                            v = feat.get("value", None)
+                            if v is not None:
+                                cv2.putText(
+                                    frame,
+                                    f"feet_lr_dist: {float(v)*100:.2f}%",
+                                    (16, 160),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    (255, 255, 255),
+                                    2,
+                                )
+            except Exception:
+                pass
+
+
+        # Draw ball + trail
+        if row is not None and bx and by:
+            x = row.get(bx, np.nan)
+            y = row.get(by, np.nan)
+            conf_ok = True
+            if bc is not None:
+                cval = row.get(bc, 1.0)
+                try:
+                    conf_ok = float(cval) >= ball_conf_th
+                except Exception:
+                    conf_ok = True
+
+            if not pd.isna(x) and not pd.isna(y) and conf_ok:
+                px = int(float(x))
+                py = int(float(y))
+                ball_trail.append((px, py))
+                # trail
+                for p in list(ball_trail)[:-1]:
+                    cv2.circle(frame, p, 2, (255, 255, 255), -1)
+                # current
+                cv2.circle(frame, (px, py), 6, (255, 255, 255), 2)
+
+            
+        writer.write(frame)
+        frame_idx_in_video += 1
+
+    cap.release()
+    writer.release()
+    return out_path
+
+
+def annotate_from_events(video_dir: Path):
+    events_path = video_dir / "events.json"
+    if not events_path.exists():
+        raise FileNotFoundError(f"events.json not found: {events_path}")
+
+    data = json.loads(events_path.read_text(encoding="utf-8"))
+    events = data.get("events", [])
+
+    for ev in events:
+        if ev.get("status") != "ok":
+            continue
+
+        throw_id = int(ev["throw_id"])
+        throw_dir_rel = ev.get("throw_dir", f"throws/throw_{throw_id:03d}")
+        throw_dir = video_dir / Path(throw_dir_rel)
+
+        clip_video_rel = ev.get("clip_video", str(Path(throw_dir_rel) / "clip.mp4"))
+        clip_csv_rel = ev.get("clip_csv", str(Path(throw_dir_rel) / "clip.csv"))
+
+        clip_mp4 = video_dir / Path(clip_video_rel)
+        clip_csv = video_dir / Path(clip_csv_rel)
+
+        if not clip_mp4.exists():
+            raise FileNotFoundError(f"clip.mp4 not found: {clip_mp4}")
+        if not clip_csv.exists():
+            raise FileNotFoundError(f"clip.csv not found: {clip_csv}")
+
+
+        df_clip = pd.read_csv(clip_csv)
+
+        # Optional: load DTW score.json if present
+        score_obj = None
+        score_path = throw_dir / "score.json"
+        if score_path.exists():
+            try:
+                score_obj = json.loads(score_path.read_text(encoding="utf-8"))
+            except Exception:
+                score_obj = None
+
+        annotate_one_throw(
+            throw_dir=throw_dir,
+            df_clip=df_clip,
+            clip_mp4=clip_mp4,
+            start_frame=int(ev["start_frame"]),
+            release_frame=int(ev["release_frame"]),
+            end_frame=int(ev["end_frame"]),
+            throw_id=throw_id,
+            score_obj=score_obj,
+        )
+
+
+
+if __name__ == "__main__":
+    # Usage:
+    #   python annotate_basic.py G:\Throwing_Project_v2\output\Eddie Throwing iPad recording 1
+    import sys
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python annotate_basic.py <video_dir>")
+    annotate_from_events(Path(sys.argv[1]))

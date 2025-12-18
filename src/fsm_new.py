@@ -23,6 +23,9 @@ from collections import deque
 import matplotlib.pyplot as plt
 from math import ceil
 import os
+import json
+
+
 
 class TennisDetector:
     def __init__(self, model_path='yolov8n.pt', confidence=0.08, iou=0.45):
@@ -133,7 +136,7 @@ class TennisDetector:
         return None
 
     def detect_video(self, video_path, output_path='output_detection.mp4',
-                      show_realtime=True, use_tracker=False, img_size=640):
+                  show_realtime=True, use_tracker=False, img_size=640, video_dir=None):
         cap = cv2.VideoCapture(video_path)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -186,12 +189,29 @@ class TennisDetector:
         release_detected_by_ratio = False
         
         # Log
-        state_log_path = os.path.join(os.path.dirname(output_path), "state_log.txt")
+        from pathlib import Path
+
+        if video_dir is not None:
+            log_dir = Path(video_dir) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            state_log_path = str(log_dir / "state_log.txt")
+        else:
+            state_log_path = os.path.join(os.path.dirname(output_path), "state_log.txt")
+
         state_log = open(state_log_path, 'w', encoding='utf-8')
         state_log.write(f"State Machine Log\n{'='*60}\n")
 
+
         # === Cache check logic ===
-        cache_file_path = "raw_pose_data.csv" # In current working directory (switched by main function)
+        from pathlib import Path
+        # Cache path
+        if video_dir is not None:
+            intermediate_dir = Path(video_dir) / "intermediate"
+            intermediate_dir.mkdir(parents=True, exist_ok=True)
+            cache_file_path = str(intermediate_dir / "raw_pose_data.csv")
+        else:
+            cache_file_path = "raw_pose_data.csv"  # fallback to old behavior
+
         df_cache = None
         if os.path.exists(cache_file_path):
             print(f"\n[CACHE] Found {cache_file_path}. Loading data to SKIP AI inference...")
@@ -199,6 +219,7 @@ class TennisDetector:
             print(f"[CACHE] Loaded {len(df_cache)} frames.")
         else:
             print("\n[CACHE] No cache found. Running full YOLO + MediaPipe inference...")
+
 
         print(f"Processing video: {video_path}")
         print(f"Resolution (Raw): {width}x{height}, FPS: {fps}, Frames: {total_frames}")
@@ -701,14 +722,25 @@ class TennisDetector:
         # === NEW FEATURE: Extract Clips (Start -> Release) ===
         # =========================================================
         if len(throw_start_frames) > 0:
+            events = []
+            if video_dir is not None:
+                events_path = Path(video_dir) / "events.json"
+            else:
+                events_path = Path(os.path.dirname(output_path)) / "events.json"
+
             print(f"\n[CLIPS] Extracting {len(throw_start_frames)} clips...")
             
             # Re-open video for reading (to jump around)
             cap_clip = cv2.VideoCapture(video_path)
             
-            # Output directory for clips
-            clips_dir = os.path.join(os.path.dirname(output_path), "clips")
-            os.makedirs(clips_dir, exist_ok=True)
+            # Output directory root (per-throw subfolders)
+            from pathlib import Path
+            if video_dir is not None:
+                throws_root = Path(video_dir) / "throws"
+            else:
+                throws_root = Path(os.path.dirname(output_path)) / "throws"
+            throws_root.mkdir(parents=True, exist_ok=True)
+
             
             # Buffer setting: frames after release to keep (e.g., 30 frames ~ 1 sec)
             post_release_buffer = 10 
@@ -719,10 +751,37 @@ class TennisDetector:
                 end_f = int(df.loc[rel_idx, "frame"]) + post_release_buffer
                 end_f = min(end_f, total_frames - 1)
                 
-                if start_f >= end_f: continue
-                
-                clip_name = f"throw_{i+1:02d}_frame_{start_f}_to_{end_f}.mp4"
-                clip_path = os.path.join(clips_dir, clip_name)
+                if start_f >= end_f:
+                    throw_id = i + 1
+                    # 这里假设你现在已经有 throw_dir 变量；如果你叫别的名字，就把 throw_dir 换成你的变量
+                    events.append({
+                        "throw_id": throw_id,
+                        "start_frame": int(start_f),
+                        "release_frame": int(df.loc[rel_idx, "frame"]),
+                        "end_frame": int(end_f),
+                        "status": "failed",
+                        "reason": "start_frame >= end_frame"
+                    })
+                    continue
+                                
+                throw_id = i + 1
+                throw_dir = throws_root / f"throw_{throw_id:03d}"
+                throw_dir.mkdir(parents=True, exist_ok=True)
+
+                clip_name = "clip.mp4"
+                clip_path = str(throw_dir / clip_name)
+                # --- record OK event (index for UI) ---
+                throw_dir_rel = str(Path("throws") / f"throw_{throw_id:03d}")
+                events.append({
+                    "throw_id": throw_id,
+                    "start_frame": int(start_f),
+                    "release_frame": int(df.loc[rel_idx, "frame"]),
+                    "end_frame": int(end_f),
+                    "status": "ok",
+                    "throw_dir": throw_dir_rel,
+                    "clip_video": str(Path(throw_dir_rel) / "clip.mp4"),
+                    "clip_csv": str(Path(throw_dir_rel) / "clip.csv")
+                })
                 
                 # Clip writer setup
                 clip_w = out_width  # Defined earlier (rotated)
@@ -790,8 +849,9 @@ class TennisDetector:
 
                 
                 # Generate CSV filename (same name as video, but with .csv extension)
-                csv_name = clip_name.replace(".mp4", ".csv")
-                csv_path = os.path.join(clips_dir, csv_name)
+                csv_name = "clip.csv"
+                csv_path = str(throw_dir / csv_name)
+
                 
                 # Save filtered DataFrame
                 clip_df[columns_to_save].to_csv(csv_path, index=False)
@@ -813,16 +873,51 @@ class TennisDetector:
                 out_clip.release()
             
             cap_clip.release()
-            print(f"[CLIPS] All clips saved to {clips_dir}")
+            # --- write events.json (video-level index) ---
+            with open(events_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "video_path": str(video_path),
+                        "fps": int(fps),
+                        "total_frames": int(total_frames),
+                        "num_throws": int(len(events)),
+                        "events": events
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2
+                )
+            print(f"[EVENTS] Saved events to {events_path}")
+
+            print(f"[CLIPS] All clips saved to {throws_root}")
 
         return df, release_frames
 
 if __name__ == "__main__":
     import os
+    import sys
+    import json
     from pathlib import Path
 
-    videos_dir = Path("videos")
+
+    # Ensure we can import annotate_basic even after chdir(out_dir)
+    SRC_DIR = Path(__file__).resolve().parent
+    if str(SRC_DIR) not in sys.path:
+        sys.path.insert(0, str(SRC_DIR))
+
+
+    videos_dir = Path("samples")
     output_root = Path("output")
+        # ===== Step 6/7 switches =====
+    ENABLE_ANNOTATION = True
+    ENABLE_DTW = True
+    DTW_SAVE_FRAME_CSV = False  # debug only; True will create *_dtw_frame.csv per throw
+
+
+    # Project root (assumes you run: python src/fsm_new.py from project root)
+    PROJECT_ROOT = Path.cwd()
+    REFERENCE_CSV = PROJECT_ROOT / "reference" / "model.csv"
+
     output_root.mkdir(exist_ok=True)
 
     seen = set()
@@ -837,7 +932,7 @@ if __name__ == "__main__":
     print(f"[INFO] Found {len(video_files)} videos in {videos_dir}")
     for video_path in video_files:
         name = video_path.stem              
-        out_dir = output_root / name            
+        out_dir = (output_root / name).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[INFO] Processing: {video_path.name}  ->  {out_dir}")
@@ -852,7 +947,122 @@ if __name__ == "__main__":
                 output_path='output_detection_with_pose.mp4',
                 show_realtime=True,
                 use_tracker=False,
-                img_size=1280
+                img_size=1280,
+                video_dir=str(out_dir)  # 先用现有 out_dir 做验证
             )
+                        # ===== Step 6: annotation (basic) =====
+            if ENABLE_ANNOTATION:
+                try:
+                    from annotate_basic import annotate_from_events
+                    annotate_from_events(out_dir)
+                    print(f"[ANNOTATE] Done: {out_dir}")
+                except Exception as e:
+                    print(f"[ANNOTATE] Failed: {e}")
+
+            # ===== Step 7: DTW scoring from events.json =====
+            if ENABLE_DTW:
+                try:
+                    from fixed_dtw_comparison import FixedMotionDTW
+
+                    events_path = Path(out_dir) / "events.json"
+                    if not events_path.exists():
+                        raise FileNotFoundError(f"Missing events.json: {events_path}")
+
+                    if not REFERENCE_CSV.exists():
+                        raise FileNotFoundError(f"Missing reference CSV: {REFERENCE_CSV}")
+
+                    with open(events_path, "r", encoding="utf-8") as f:
+                        events_obj = json.load(f)
+
+                    comparator = FixedMotionDTW(str(REFERENCE_CSV), reference_handedness="auto")
+                    # Load per-feature DTW thresholds (debug thresholds ok)
+                    thresholds_path = PROJECT_ROOT / "config" / "dtw_thresholds.json"
+                    with open(thresholds_path, "r", encoding="utf-8") as tf:
+                        thresholds = json.load(tf)
+
+
+                    for ev in events_obj.get("events", []):
+                        if ev.get("status") != "ok":
+                            continue
+
+                        throw_id = ev.get("throw_id")
+                        throw_dir = Path(out_dir) / ev.get("throw_dir", "")
+                        clip_csv = Path(out_dir) / ev.get("clip_csv", "")
+
+                        if not clip_csv.exists():
+                            print(f"[DTW] throw_{throw_id:03d}: missing clip_csv -> {clip_csv}")
+                            continue
+
+                        scores, frame_dists, meta = comparator.compare(
+                            student_csv=str(clip_csv),
+                            handedness="auto",
+                            save_frame_csv=DTW_SAVE_FRAME_CSV
+                        )
+
+                                                # Build per-feature output with level based on thresholds.json
+                        features_out = {}
+                        for k in comparator.FEATURE_NAMES:
+                            v = scores.get(k)
+                            if v is None:
+                                continue
+
+                            cfg = thresholds.get(k)
+                            if cfg is None:
+                                # If missing in json, do not crash; mark as "unknown"
+                                features_out[k] = {
+                                    "value": v,
+                                    "level": "unknown"
+                                }
+                                continue
+
+                            warn = float(cfg.get("warn", 0.0))
+                            bad = float(cfg.get("bad", 1e9))
+                            ftype = cfg.get("type", "unknown")
+
+                            if v >= bad:
+                                level = "bad"
+                            elif v >= warn:
+                                level = "warn"
+                            else:
+                                level = "ok"
+
+                            features_out[k] = {
+                                "type": ftype,
+                                "value": float(v),
+                                "level": level,
+                                "warn": warn,
+                                "bad": bad
+                            }
+
+                        score_obj = {
+                            "throw_id": throw_id,
+                            "status": ev.get("status", "ok"),
+                            "window": {
+                                "start_frame": ev.get("start_frame"),
+                                "release_frame": ev.get("release_frame"),
+                                "end_frame": ev.get("end_frame"),
+                            },
+                            "meta": meta,
+                            "dtw": {
+                                "features": features_out,
+                                "overall_matching_score": scores.get("overall_matching_score"),
+                            },
+                        }
+
+
+                        throw_dir.mkdir(parents=True, exist_ok=True)
+                        score_path = throw_dir / "score.json"
+                        with open(score_path, "w", encoding="utf-8") as wf:
+                            json.dump(score_obj, wf, ensure_ascii=False, indent=2)
+
+                        print(f"[DTW] throw_{throw_id:03d} -> {score_path}")
+
+                    print(f"[DTW] Done: {out_dir}")
+
+                except Exception as e:
+                    print(f"[DTW] Failed: {e}")
+
+
+
         finally:
             os.chdir(old_cwd)

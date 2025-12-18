@@ -40,8 +40,23 @@ class FixedMotionDTW:
         "elbow_to_samehip_dist",           # dominant elbow to dominant hip
         "elbow_to_opphip_dist",            # dominant elbow to opposite hip
         "shoulder_to_wrist_y_dist",         # |y_shoulder - y_wrist|
-        "shoulder_to_elbow_y_dist",         # |y_shoulder - y_elbow|
+        "shoulder_to_elbow_y_dist",
+        # |y_shoulder - y_elbow|
     ]
+
+    # Angle features should be compared in absolute degrees (raw),
+    # but DTW alignment can use a normalized distance to stay scale-consistent.
+    ANGLE_FEATURES = {"elbow_angle", "shoulder_angle", "hip_angle"}
+    ANGLE_MAX_DEG = 180.0
+
+    def _angle_distance_norm(self, x, y) -> float:
+        """
+        DTW distance for angles: normalized absolute degree difference.
+        Return in [0, 1] by dividing by 180.
+        """
+        ref_val = float(x[0])
+        stu_val = float(y[0])
+        return min(abs(ref_val - stu_val) / self.ANGLE_MAX_DEG, 1.0)
 
     def __init__(self, reference_csv: str, reference_handedness: str = "auto"):
         self.reference_df = pd.read_csv(reference_csv)
@@ -427,13 +442,24 @@ class FixedMotionDTW:
 
         return frame_distances
 
-    def _compute_dtw(self, ref_seq: np.ndarray, stu_seq: np.ndarray) -> Tuple[float, list, np.ndarray]:
+    def _compute_dtw(
+        self,
+        ref_seq: np.ndarray,
+        stu_seq: np.ndarray,
+        dist_fn=None,
+        frame_use_relative: bool = True,
+    ) -> Tuple[float, list, np.ndarray]:
         """
         Returns:
             dtw_norm: distance/len(path) (kept for debugging)
             path: DTW path
-            frame_dists: aligned per-student-frame distances (relative)
+            frame_dists: aligned per-student-frame distances
+                - relative (0..1) if frame_use_relative=True
+                - absolute (raw) if frame_use_relative=False
         """
+        if dist_fn is None:
+            dist_fn = self._relative_distance
+
         ref_i = self._interpolate_sequence(ref_seq)
         stu_i = self._interpolate_sequence(stu_seq)
 
@@ -446,11 +472,14 @@ class FixedMotionDTW:
         ref_r = ref_i.reshape(-1, 1)
         stu_r = stu_i.reshape(-1, 1)
 
-        dist, path = fastdtw(ref_r, stu_r, dist=self._relative_distance)
+        dist, path = fastdtw(ref_r, stu_r, dist=dist_fn)
         dtw_norm = float(dist) / max(len(path), 1)
 
-        frame_dists = self._compute_frame_distances_from_path(ref_i, stu_i, path, use_relative=True)
+        frame_dists = self._compute_frame_distances_from_path(
+            ref_i, stu_i, path, use_relative=frame_use_relative
+        )
         return dtw_norm, path, frame_dists
+
 
     def compare(
         self,
@@ -490,20 +519,39 @@ class FixedMotionDTW:
 
         per_feature_score: Dict[str, float] = {}
         frame_distances_dict: Dict[str, np.ndarray] = {}
-
         for feat in self.FEATURE_NAMES:
             ref_seq = self.reference_features.get(feat, np.full(len(self.reference_df), np.nan))
             stu_seq = student_features.get(feat, np.full(len(student_df), np.nan))
 
-            _, _, frame_dists = self._compute_dtw(ref_seq, stu_seq)
-            frame_distances_dict[feat] = frame_dists
+            if feat in self.ANGLE_FEATURES:
+                # DTW alignment uses normalized distance, but output distances are raw degrees
+                _, _, frame_dists_deg = self._compute_dtw(
+                    ref_seq, stu_seq, dist_fn=self._angle_distance_norm, frame_use_relative=False
+                )
+                frame_distances_dict[feat] = frame_dists_deg
 
-            # Teacher Step 1: 1 scalar per variable = average across frames
-            per_feature_score[feat] = float(np.nanmean(frame_dists)) if np.any(~np.isnan(frame_dists)) else np.nan
+                # Teacher Step 1 (angle): raw degree difference scalar
+                per_feature_score[feat] = float(np.nanmean(frame_dists_deg)) if np.any(~np.isnan(frame_dists_deg)) else np.nan
+            else:
+                # Non-angle: keep your original relative-distance pipeline
+                _, _, frame_dists = self._compute_dtw(ref_seq, stu_seq)
+                frame_distances_dict[feat] = frame_dists
 
-        # Teacher Step 2: overall matching score = average across variable scalars
-        vals = [v for v in per_feature_score.values() if not np.isnan(v)]
-        per_feature_score["overall_matching_score"] = float(np.mean(vals)) if vals else np.nan
+                per_feature_score[feat] = float(np.nanmean(frame_dists)) if np.any(~np.isnan(frame_dists)) else np.nan
+
+        # Teacher Step 2: overall matching score = average across variables
+        # Angles are normalized by 180 for the overall only.
+        vals_norm = []
+        for feat in self.FEATURE_NAMES:
+            v = per_feature_score.get(feat, np.nan)
+            if np.isnan(v):
+                continue
+            if feat in self.ANGLE_FEATURES:
+                vals_norm.append(min(v / self.ANGLE_MAX_DEG, 1.0))
+            else:
+                vals_norm.append(v)
+
+        per_feature_score["overall_matching_score"] = float(np.mean(vals_norm)) if vals_norm else np.nan
 
         # Optional: save per-frame distances CSV (debug)
         if save_frame_csv:
@@ -560,7 +608,10 @@ class FixedMotionDTW:
             if np.isnan(v):
                 print(f"{k:28s}: NaN")
             else:
-                print(f"{k:28s}: {v:.4f} ({v*100:.1f}%)")
+                if k in self.ANGLE_FEATURES:
+                    print(f"{k:28s}: {v:.2f} deg")
+                else:
+                    print(f"{k:28s}: {v:.4f} ({v*100:.1f}%)")
         print("-" * 70)
         ov = scores.get("overall_matching_score", np.nan)
         if np.isnan(ov):
@@ -573,9 +624,10 @@ class FixedMotionDTW:
 
 
 if __name__ == "__main__":
-    # Example usage (adjust paths yourself)
-    ref_csv = "model/standard_throw.csv"
-    stu_csv = "output/video1/clips/throw_01_frame_114_to_182.csv"
+
+    # Example usage (project-root relative)
+    ref_csv = "reference/model.csv"
+    stu_csv = "output/Eddie Throwing iPad recording 1/throws/throw_001/clip.csv"
 
     comparator = FixedMotionDTW(ref_csv, reference_handedness="auto")
     comparator.print_results(stu_csv, handedness="auto")

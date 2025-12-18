@@ -106,7 +106,7 @@ def _discover_ball_columns(df: pd.DataFrame):
 
     return None, None, None
 
-def draw_bracket_between_points(img, p1, p2, offset=14, tick=10, thickness=2):
+def draw_bracket_between_points(img, p1, p2, offset=14, tick=10, thickness=2, color=(255, 255, 255)):
     """
     Draw a simple bracket-like marker between two points.
     p1, p2: (x, y) in pixel coords
@@ -133,14 +133,64 @@ def draw_bracket_between_points(img, p1, p2, offset=14, tick=10, thickness=2):
     sx2, sy2 = int(x2 + nx * offset), int(y2 + ny * offset)
 
     # main line
-    cv2.line(img, (sx1, sy1), (sx2, sy2), (255, 255, 255), thickness)
+    cv2.line(img, (sx1, sy1), (sx2, sy2), color, thickness)
 
     # ticks at ends (pointing toward the original segment)
     tx1, ty1 = int(sx1 - nx * tick), int(sy1 - ny * tick)
     tx2, ty2 = int(sx2 - nx * tick), int(sy2 - ny * tick)
 
-    cv2.line(img, (sx1, sy1), (tx1, ty1), (255, 255, 255), thickness)
-    cv2.line(img, (sx2, sy2), (tx2, ty2), (255, 255, 255), thickness)
+    cv2.line(img, (sx1, sy1), (tx1, ty1), color, thickness)
+    cv2.line(img, (sx2, sy2), (tx2, ty2), color, thickness)
+
+def draw_vertical_ruler(img, x, y1, y2, tick=10, thickness=2, color=(255, 255, 255)):
+    """
+    Draw a vertical ruler between y1 and y2 at fixed x, with small horizontal ticks.
+    x: pixel x
+    y1, y2: pixel y
+    """
+    import cv2
+
+    x = int(x)
+    y1 = int(y1)
+    y2 = int(y2)
+    if y1 == y2:
+        return
+    if y1 > y2:
+        y1, y2 = y2, y1
+
+    # main vertical line
+    cv2.line(img, (x, y1), (x, y2), color, thickness)
+
+    # ticks (horizontal)
+    cv2.line(img, (x - tick, y1), (x + tick, y1), color, thickness)
+    cv2.line(img, (x - tick, y2), (x + tick, y2), color, thickness)
+
+def draw_angle_marker(img, vtx, p1, p2, length=28, thickness=2, color=(255, 255, 255)):
+    """
+    Draw a minimal angle marker at vtx using two short rays toward p1 and p2.
+    vtx, p1, p2: (x, y) pixel coords
+    """
+    import cv2
+    import numpy as np
+
+    vx, vy = float(vtx[0]), float(vtx[1])
+    a = np.array([float(p1[0]) - vx, float(p1[1]) - vy], dtype=float)
+    b = np.array([float(p2[0]) - vx, float(p2[1]) - vy], dtype=float)
+
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na < 1e-6 or nb < 1e-6:
+        return
+
+    a = a / na
+    b = b / nb
+
+    p1s = (int(vx + a[0] * length), int(vy + a[1] * length))
+    p2s = (int(vx + b[0] * length), int(vy + b[1] * length))
+
+    cv2.line(img, (int(vx), int(vy)), p1s, color, thickness)
+    cv2.line(img, (int(vx), int(vy)), p2s, color, thickness)
+
 
 def discover_named_points(df):
     names = [
@@ -159,6 +209,36 @@ def discover_named_points(df):
         if x in df.columns and y in df.columns:
             pts[n] = (x, y)
     return pts
+
+def draw_dashed_line(img, p1, p2, dash_len=10, gap_len=8, thickness=2, color=(255, 255, 255)):
+    """
+    Draw a dashed line from p1 to p2.
+    p1, p2: (x, y) pixel coords
+    """
+    import cv2
+    import numpy as np
+
+    x1, y1 = float(p1[0]), float(p1[1])
+    x2, y2 = float(p2[0]), float(p2[1])
+
+    dx, dy = x2 - x1, y2 - y1
+    dist = (dx * dx + dy * dy) ** 0.5
+    if dist < 1e-6:
+        return
+
+    ux, uy = dx / dist, dy / dist
+    step = dash_len + gap_len
+    n = int(dist // step) + 1
+
+    for i in range(n):
+        s = i * step
+        e = min(s + dash_len, dist)
+
+        sx, sy = x1 + ux * s, y1 + uy * s
+        ex, ey = x1 + ux * e, y1 + uy * e
+
+        cv2.line(img, (int(sx), int(sy)), (int(ex), int(ey)), color, thickness)
+
 
 def annotate_one_throw(
     throw_dir: Path,
@@ -328,7 +408,7 @@ def annotate_one_throw(
                 if a in pts and b in pts:
                     cv2.line(frame, pts[a], pts[b], (255, 255, 255), 1)
 
-                # ===== DTW-driven bracket: feet_lr_dist =====
+        # ===== DTW-driven bracket: feet_lr_dist =====
         if row is not None and score_obj is not None and named_pts:
             try:
                 feat = score_obj.get("dtw", {}).get("features", {}).get("feet_lr_dist", None)
@@ -345,8 +425,12 @@ def annotate_one_throw(
                         if not pd.isna(lx) and not pd.isna(ly) and not pd.isna(rx) and not pd.isna(ry):
                             pL = (float(lx), float(ly))
                             pR = (float(rx), float(ry))
-                            draw_bracket_between_points(frame, pL, pR, offset=16, tick=10, thickness=2)
-
+                            level = feat.get("level", "ok")
+                            if level == "bad":
+                                color = (0, 0, 255)      # red (BGR)
+                            else:
+                                color = (0, 255, 255)    # warn -> yellow (BGR)
+                            draw_bracket_between_points(frame, pL, pR, offset=16, tick=10, thickness=2, color=color)
                             # Optional label: show feet_lr_dist value
                             v = feat.get("value", None)
                             if v is not None:
@@ -356,9 +440,156 @@ def annotate_one_throw(
                                     (16, 160),
                                     cv2.FONT_HERSHEY_SIMPLEX,
                                     0.6,
-                                    (255, 255, 255),
+                                    color,
                                     2,
                                 )
+            except Exception:
+                pass
+
+        # ===== DTW-driven vertical ruler: shoulder_to_wrist_y_dist =====
+        if row is not None and score_obj is not None and named_pts:
+            try:
+                feat = score_obj.get("dtw", {}).get("features", {}).get("shoulder_to_wrist_y_dist", None)
+                if isinstance(feat, dict) and feat.get("level", "ok") != "ok":
+                    level = feat.get("level", "warn")
+                    if level == "bad":
+                        color = (0, 0, 255)      # red (BGR)
+                    else:
+                        color = (0, 255, 255)    # warn -> yellow (BGR)
+
+                    # choose side by dominant_side
+                    meta = score_obj.get("meta", {}) or {}
+                    side = meta.get("dominant_side", "left")  # "left" or "right"
+
+                    sh_name = f"{side}_shoulder"
+                    wr_name = f"{side}_wrist"
+
+                    if sh_name in named_pts and wr_name in named_pts:
+                        shx_col, shy_col = named_pts[sh_name]
+                        wrx_col, wry_col = named_pts[wr_name]
+
+                        shx, shy = row.get(shx_col, np.nan), row.get(shy_col, np.nan)
+                        wrx, wry = row.get(wrx_col, np.nan), row.get(wry_col, np.nan)
+
+                        if not pd.isna(shx) and not pd.isna(shy) and not pd.isna(wrx) and not pd.isna(wry):
+                            shx, shy = float(shx), float(shy)
+                            wrx, wry = float(wrx), float(wry)
+
+                            # place the ruler slightly to the right of the mid-x, to avoid overlapping skeleton
+                            rx = wrx
+                            draw_vertical_ruler(frame, rx, shy, wry, tick=10, thickness=2, color=color)
+
+                            # optional label
+                            v = feat.get("value", None)
+                            if v is not None:
+                                cv2.putText(
+                                    frame,
+                                    f"shoulder_to_wrist_y: {float(v)*100:.2f}%",
+                                    (16, 185),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    color,
+                                    2,
+                                )
+            except Exception:
+                pass
+        # ===== DTW-driven dashed line: wrist_to_samehip_dist =====
+        if row is not None and score_obj is not None and named_pts:
+            try:
+                feat = score_obj.get("dtw", {}).get("features", {}).get("wrist_to_samehip_dist", None)
+                if isinstance(feat, dict) and feat.get("level", "ok") != "ok":
+                    level = feat.get("level", "warn")
+                    if level == "bad":
+                        color = (0, 0, 255)      # red
+                    else:
+                        color = (0, 255, 255)    # yellow
+
+                    meta = score_obj.get("meta", {}) or {}
+                    side = meta.get("dominant_side", "left")  # "left" or "right"
+
+                    wr_name = f"{side}_wrist"
+                    hip_name = f"{side}_hip"
+
+                    if wr_name in named_pts and hip_name in named_pts:
+                        wrx_col, wry_col = named_pts[wr_name]
+                        hpx_col, hpy_col = named_pts[hip_name]
+
+                        wrx, wry = row.get(wrx_col, np.nan), row.get(wry_col, np.nan)
+                        hpx, hpy = row.get(hpx_col, np.nan), row.get(hpy_col, np.nan)
+
+                        if not pd.isna(wrx) and not pd.isna(wry) and not pd.isna(hpx) and not pd.isna(hpy):
+                            pW = (float(wrx), float(wry))
+                            pH = (float(hpx), float(hpy))
+
+                            # dashed line (usually diagonal)
+                            draw_dashed_line(frame, pW, pH, dash_len=10, gap_len=8, thickness=2, color=color)
+
+                            # optional label near wrist
+                            v = feat.get("value", None)
+                            if v is not None:
+                                cv2.putText(
+                                    frame,
+                                    f"wrist_to_samehip: {float(v)*100:.2f}%",
+                                    (int(pW[0]) + 8, int(pW[1]) - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5,
+                                    color,
+                                    2,
+                                )
+            except Exception:
+                pass
+
+        # ===== DTW-driven angle markers: elbow/shoulder/hip =====
+        if row is not None and score_obj is not None and named_pts:
+            try:
+                feats = score_obj.get("dtw", {}).get("features", {}) or {}
+                meta = score_obj.get("meta", {}) or {}
+                side = meta.get("dominant_side", "left")  # "left"/"right"
+
+                def level_color(level: str):
+                    if level == "bad":
+                        return (0, 0, 255)      # red
+                    return (0, 255, 255)        # warn -> yellow
+
+                def get_pt(name):
+                    if name not in named_pts:
+                        return None
+                    xcol, ycol = named_pts[name]
+                    x, y = row.get(xcol, np.nan), row.get(ycol, np.nan)
+                    if pd.isna(x) or pd.isna(y):
+                        return None
+                    return (float(x), float(y))
+
+                # --- elbow_angle: shoulder - elbow - wrist
+                feat = feats.get("elbow_angle", None)
+                if isinstance(feat, dict) and feat.get("level", "ok") != "ok":
+                    c = level_color(feat.get("level", "warn"))
+                    sh = get_pt(f"{side}_shoulder")
+                    el = get_pt(f"{side}_elbow")
+                    wr = get_pt(f"{side}_wrist")
+                    if sh and el and wr:
+                        draw_angle_marker(frame, el, sh, wr, length=26, thickness=2, color=c)
+
+                # --- shoulder_angle: hip - shoulder - elbow  (torso vs upper arm)
+                feat = feats.get("shoulder_angle", None)
+                if isinstance(feat, dict) and feat.get("level", "ok") != "ok":
+                    c = level_color(feat.get("level", "warn"))
+                    hp = get_pt(f"{side}_hip")
+                    sh = get_pt(f"{side}_shoulder")
+                    el = get_pt(f"{side}_elbow")
+                    if hp and sh and el:
+                        draw_angle_marker(frame, sh, hp, el, length=26, thickness=2, color=c)
+
+                # --- hip_angle: shoulder - hip - knee (torso vs thigh)
+                feat = feats.get("hip_angle", None)
+                if isinstance(feat, dict) and feat.get("level", "ok") != "ok":
+                    c = level_color(feat.get("level", "warn"))
+                    sh = get_pt(f"{side}_shoulder")
+                    hp = get_pt(f"{side}_hip")
+                    kn = get_pt(f"{side}_knee")
+                    if sh and hp and kn:
+                        draw_angle_marker(frame, hp, sh, kn, length=26, thickness=2, color=c)
+
             except Exception:
                 pass
 

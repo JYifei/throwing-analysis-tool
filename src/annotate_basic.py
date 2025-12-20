@@ -339,37 +339,68 @@ def annotate_one_throw(
 
                 angle_feats = {"elbow_angle", "shoulder_angle", "hip_angle"}
 
-                # Rank "most off" by normalized severity (angle/180, others are already 0..1)
-                ranked = []
+                def level_color(level: str):
+                    if level == "bad":
+                        return (0, 0, 255)      # red
+                    return (0, 255, 255)        # warn -> yellow
+
+                # Collect ALL non-ok features
+                bad_items = []
+                warn_items = []
+
                 for k, v in feats.items():
-                    if v is None:
+                    if not isinstance(v, dict):
+                        # backward-compat if someone produces float features
                         continue
+                    level = v.get("level", "ok")
+                    if level == "ok" or level == "unknown":
+                        continue
+
                     try:
-                        fv = float(v["value"]) if isinstance(v, dict) else float(v)
+                        fv = float(v.get("value"))
                     except Exception:
                         continue
-                    sev = (fv / 180.0) if k in angle_feats else fv
-                    ranked.append((sev, k, fv))
-                ranked.sort(reverse=True)
 
+                    # format text
+                    if k in angle_feats:
+                        text = f"{k}: {fv:.1f} deg"
+                    else:
+                        text = f"{k}: {fv*100:.1f}%"
+
+                    item = (text, level)
+                    if level == "bad":
+                        bad_items.append(item)
+                    else:
+                        warn_items.append(item)
+
+                # Fixed panel lines: overall + BAD then WARN
                 lines = []
+                colors = []
+
                 if overall is not None:
                     try:
                         ov = float(overall)
                         lines.append(f"DTW overall: {ov*100:.1f}%")
+                        colors.append((255, 255, 255))
                     except Exception:
                         pass
 
-                # show top-3 largest deviations
-                for sev, k, fv in ranked[:3]:
-                    if k in angle_feats:
-                        lines.append(f"{k}: {fv:.1f} deg")
-                    else:
-                        lines.append(f"{k}: {fv*100:.1f}%")
+                # show all bad first, then all warn
+                for text, level in bad_items:
+                    lines.append(text)
+                    colors.append(level_color(level))
+                for text, level in warn_items:
+                    lines.append(text)
+                    colors.append(level_color(level))
 
+                # draw (fixed location)
                 y0 = 52
                 for i, s in enumerate(lines):
-                    cv2.putText(frame, s, (16, y0 + 22*i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    if i >= 8:
+                        break  # 防止面板过长；如果你想全显示我们下一步做滚动/分页
+                    cv2.putText(frame, s, (16, y0 + 22*i),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[i], 2)
+
             except Exception:
                 pass
 
@@ -431,18 +462,6 @@ def annotate_one_throw(
                             else:
                                 color = (0, 255, 255)    # warn -> yellow (BGR)
                             draw_bracket_between_points(frame, pL, pR, offset=16, tick=10, thickness=2, color=color)
-                            # Optional label: show feet_lr_dist value
-                            v = feat.get("value", None)
-                            if v is not None:
-                                cv2.putText(
-                                    frame,
-                                    f"feet_lr_dist: {float(v)*100:.2f}%",
-                                    (16, 160),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.6,
-                                    color,
-                                    2,
-                                )
             except Exception:
                 pass
 
@@ -479,20 +498,43 @@ def annotate_one_throw(
                             rx = wrx
                             draw_vertical_ruler(frame, rx, shy, wry, tick=10, thickness=2, color=color)
 
-                            # optional label
-                            v = feat.get("value", None)
-                            if v is not None:
-                                cv2.putText(
-                                    frame,
-                                    f"shoulder_to_wrist_y: {float(v)*100:.2f}%",
-                                    (16, 185),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.6,
-                                    color,
-                                    2,
-                                )
             except Exception:
                 pass
+            
+                # ===== DTW-driven vertical ruler: shoulder_to_elbow_y_dist =====
+        if row is not None and score_obj is not None and named_pts:
+            try:
+                feat = score_obj.get("dtw", {}).get("features", {}).get("shoulder_to_elbow_y_dist", None)
+                if isinstance(feat, dict) and feat.get("level", "ok") != "ok":
+                    level = feat.get("level", "warn")
+                    if level == "bad":
+                        color = (0, 0, 255)      # red (BGR)
+                    else:
+                        color = (0, 255, 255)    # warn -> yellow (BGR)
+
+                    meta = score_obj.get("meta", {}) or {}
+                    side = meta.get("dominant_side", "left")  # "left" or "right"
+
+                    sh_name = f"{side}_shoulder"
+                    el_name = f"{side}_elbow"
+
+                    if sh_name in named_pts and el_name in named_pts:
+                        shx_col, shy_col = named_pts[sh_name]
+                        elx_col, ely_col = named_pts[el_name]
+
+                        shx, shy = row.get(shx_col, np.nan), row.get(shy_col, np.nan)
+                        elx, ely = row.get(elx_col, np.nan), row.get(ely_col, np.nan)
+
+                        if not pd.isna(shx) and not pd.isna(shy) and not pd.isna(elx) and not pd.isna(ely):
+                            shx, shy = float(shx), float(shy)
+                            elx, ely = float(elx), float(ely)
+
+                            rx = elx   # 绑定在肘的位置（和你 wrist 绑定风格一致）
+                            draw_vertical_ruler(frame, rx, shy, ely, tick=10, thickness=2, color=color)
+
+            except Exception:
+                pass
+      
         # ===== DTW-driven dashed line: wrist_to_samehip_dist =====
         if row is not None and score_obj is not None and named_pts:
             try:
@@ -524,21 +566,42 @@ def annotate_one_throw(
                             # dashed line (usually diagonal)
                             draw_dashed_line(frame, pW, pH, dash_len=10, gap_len=8, thickness=2, color=color)
 
-                            # optional label near wrist
-                            v = feat.get("value", None)
-                            if v is not None:
-                                cv2.putText(
-                                    frame,
-                                    f"wrist_to_samehip: {float(v)*100:.2f}%",
-                                    (int(pW[0]) + 8, int(pW[1]) - 8),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5,
-                                    color,
-                                    2,
-                                )
             except Exception:
                 pass
+        
+                # ===== DTW-driven dashed line: elbow_to_samehip_dist =====
+        if row is not None and score_obj is not None and named_pts:
+            try:
+                feat = score_obj.get("dtw", {}).get("features", {}).get("elbow_to_samehip_dist", None)
+                if isinstance(feat, dict) and feat.get("level", "ok") != "ok":
+                    level = feat.get("level", "warn")
+                    if level == "bad":
+                        color = (0, 0, 255)      # red
+                    else:
+                        color = (0, 255, 255)    # yellow
 
+                    meta = score_obj.get("meta", {}) or {}
+                    side = meta.get("dominant_side", "left")  # "left" or "right"
+
+                    el_name = f"{side}_elbow"
+                    hip_name = f"{side}_hip"
+
+                    if el_name in named_pts and hip_name in named_pts:
+                        elx_col, ely_col = named_pts[el_name]
+                        hpx_col, hpy_col = named_pts[hip_name]
+
+                        elx, ely = row.get(elx_col, np.nan), row.get(ely_col, np.nan)
+                        hpx, hpy = row.get(hpx_col, np.nan), row.get(hpy_col, np.nan)
+
+                        if not pd.isna(elx) and not pd.isna(ely) and not pd.isna(hpx) and not pd.isna(hpy):
+                            pE = (float(elx), float(ely))
+                            pH = (float(hpx), float(hpy))
+
+                            draw_dashed_line(frame, pE, pH, dash_len=10, gap_len=8, thickness=2, color=color)
+
+            except Exception:
+                pass  
+        
         # ===== DTW-driven angle markers: elbow/shoulder/hip =====
         if row is not None and score_obj is not None and named_pts:
             try:

@@ -1,0 +1,53 @@
+{
+  "elbow_angle": {
+    "type": "angle",
+    "warn": 0.0,
+    "bad": 25.0
+  },
+  "shoulder_angle": {
+    "type": "angle",
+    "warn": 0.0,
+    "bad": 25.0
+  },
+  "hip_angle": {
+    "type": "angle",
+    "warn": 0.0,
+    "bad": 25.0
+  },
+
+  "feet_lr_dist": {
+    "type": "distance",
+    "warn": 0.0,
+    "bad": 0.30
+  },
+  "wrist_to_samehip_dist": {
+    "type": "distance",
+    "warn": 0.0,
+    "bad": 0.30
+  },
+  "wrist_to_opphip_dist": {
+    "type": "distance",
+    "warn": 0.0,
+    "bad": 0.30
+  },
+  "elbow_to_samehip_dist": {
+    "type": "distance",
+    "warn": 0.0,
+    "bad": 0.30
+  },
+  "elbow_to_opphip_dist": {
+    "type": "distance",
+    "warn": 0.0,
+    "bad": 0.30
+  },
+  "shoulder_to_wrist_y_dist": {
+    "type": "distance",
+    "warn": 0.0,
+    "bad": 0.30
+  },
+  "shoulder_to_elbow_y_dist": {
+    "type": "distance",
+    "warn": 0.0,
+    "bad": 0.30
+  }
+}

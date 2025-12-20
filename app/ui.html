@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Throwing Analysis Tool</title>
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Arial, sans-serif;
+      margin: 16px;
+      background: #fafafa;
+    }
+    h1 { margin-bottom: 4px; }
+    .muted { color: #666; font-size: 12px; }
+
+    .row {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+
+    .card {
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 12px;
+      background: #fff;
+    }
+
+    .card h2 {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 13px;
+    }
+
+    th, td {
+      border: 1px solid #ddd;
+      padding: 6px 8px;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f4f4f4;
+      text-align: left;
+    }
+
+    img {
+      max-width: 520px;
+      height: auto;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      margin-bottom: 10px;
+    }
+
+    .btn {
+      padding: 8px 12px;
+      border: 1px solid #333;
+      border-radius: 8px;
+      background: #111;
+      color: #fff;
+      cursor: pointer;
+    }
+
+    .btn:disabled {
+      background: #888;
+      border-color: #888;
+      cursor: not-allowed;
+    }
+
+    code {
+      background: #f4f4f4;
+      padding: 2px 4px;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>Throwing Analysis Tool</h1>
+  <p class="muted">
+    Upload a video to run the analysis. The system will generate clips, scores, and plots.
+  </p>
+
+  <!-- Step 1 -->
+  <div class="card">
+    <h2>1) Upload and Run Analysis</h2>
+
+    <form id="jobForm">
+      <div style="margin-bottom:10px;">
+        <input id="videoFile" type="file" accept="video/*" required />
+      </div>
+
+      <div style="display:flex; gap:16px; align-items:center; margin-bottom:10px;">
+        <label>
+          <input id="enableDTW" type="checkbox" checked />
+          Enable DTW Scoring
+        </label>
+        <label>
+          <input id="enableAnno" type="checkbox" />
+          Enable Video Annotation
+        </label>
+      </div>
+
+      <button id="runBtn" class="btn" type="submit">Run Analysis</button>
+      <span id="statusText" class="muted" style="margin-left:10px;"></span>
+    </form>
+  </div>
+
+  <!-- Step 2 -->
+  <div class="row">
+    <div class="card" style="flex: 1 1 720px;">
+      <h2>2) Job Overview</h2>
+      <div id="jobMeta" class="muted">Not started yet.</div>
+      <div style="margin-top:10px;">
+        <a id="downloadLink" class="btn" href="#" style="display:none; text-decoration:none;">
+          Download results.zip
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Step 3 & 4 -->
+  <div class="row">
+    <div class="card" style="flex: 1 1 720px;">
+      <h2>3) Scores Summary</h2>
+      <div id="scoresArea" class="muted">Waiting for analysis results…</div>
+    </div>
+
+    <div class="card" style="flex: 1 1 520px;">
+      <h2>4) Plots</h2>
+      <div id="plotsArea" class="muted">Waiting for analysis results…</div>
+    </div>
+  </div>
+
+<script>
+  const form = document.getElementById("jobForm");
+  const runBtn = document.getElementById("runBtn");
+  const statusText = document.getElementById("statusText");
+  const jobMeta = document.getElementById("jobMeta");
+  const downloadLink = document.getElementById("downloadLink");
+  const scoresArea = document.getElementById("scoresArea");
+  const plotsArea = document.getElementById("plotsArea");
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, m =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])
+    );
+  }
+
+  function toRelRunsPath(absPath) {
+    const p = String(absPath);
+    const idx = p.toLowerCase().lastIndexOf("\\runs\\");
+    if (idx >= 0) {
+      return "/runs/" + p.substring(idx + 6).replaceAll("\\", "/");
+    }
+    const idx2 = p.toLowerCase().lastIndexOf("/runs/");
+    if (idx2 >= 0) return p.substring(idx2);
+    return null;
+  }
+
+  function renderTable(rows) {
+    if (!rows || rows.length === 0) {
+      return "<div class='muted'>scores_summary.json is empty.</div>";
+    }
+
+    const cols = new Set();
+    rows.forEach(r => Object.keys(r).forEach(k => cols.add(k)));
+    const colList = Array.from(cols);
+
+    let html = "<table><thead><tr>";
+    colList.forEach(c => html += "<th>" + escapeHtml(c) + "</th>");
+    html += "</tr></thead><tbody>";
+
+    rows.forEach(r => {
+      html += "<tr>";
+      colList.forEach(c => {
+        let v = r[c];
+        if (typeof v === "object" && v !== null) v = JSON.stringify(v);
+        html += "<td>" + escapeHtml(v ?? "") + "</td>";
+      });
+      html += "</tr>";
+    });
+
+    html += "</tbody></table>";
+    return html;
+  }
+
+  async function fetchJson(url) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("Failed to fetch " + url);
+    return await resp.json();
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const file = document.getElementById("videoFile").files[0];
+    if (!file) return;
+
+    runBtn.disabled = true;
+    statusText.textContent = "Uploading and running analysis…";
+    jobMeta.textContent = "Running…";
+    scoresArea.innerHTML = "<div class='muted'>Running…</div>";
+    plotsArea.innerHTML = "<div class='muted'>Running…</div>";
+    downloadLink.style.display = "none";
+
+    try {
+      const fd = new FormData();
+      fd.append("video", file);
+      fd.append("enable_dtw", document.getElementById("enableDTW").checked);
+      fd.append("enable_annotation", document.getElementById("enableAnno").checked);
+
+      const resp = await fetch("/api/jobs", { method: "POST", body: fd });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "Job failed");
+
+      statusText.textContent = "Completed";
+      jobMeta.innerHTML = `
+        <div>job_id: <code>${escapeHtml(data.job_id)}</code></div>
+        <div class="muted">out_dir: ${escapeHtml(data.result.out_dir)}</div>
+      `;
+
+      downloadLink.href = data.download_url;
+      downloadLink.style.display = "inline-block";
+
+      // Plots
+      const plots = data.result.plots || [];
+      if (plots.length === 0) {
+        plotsArea.innerHTML = "<div class='muted'>No plots generated.</div>";
+      } else {
+        plotsArea.innerHTML = plots.map(p => {
+          const rel = toRelRunsPath(p);
+          return rel
+            ? `<img src="${rel}" alt="plot" />`
+            : `<div class="muted">Invalid plot path: ${escapeHtml(p)}</div>`;
+        }).join("");
+      }
+
+      // Scores
+      const summaryAbs = data.result.summary_scores;
+      const summaryRel = summaryAbs ? toRelRunsPath(summaryAbs) : null;
+      if (!summaryRel) {
+        scoresArea.innerHTML = "<div class='muted'>scores_summary.json not found.</div>";
+      } else {
+        const summary = await fetchJson(summaryRel);
+        const rows = Array.isArray(summary)
+          ? summary
+          : (summary.rows || summary.data || []);
+        scoresArea.innerHTML = renderTable(rows);
+      }
+
+    } catch (err) {
+      statusText.textContent = "Failed: " + err;
+      jobMeta.textContent = "Job failed. Check backend logs.";
+      scoresArea.innerHTML = "<div class='muted'>Failed.</div>";
+      plotsArea.innerHTML = "<div class='muted'>Failed.</div>";
+    } finally {
+      runBtn.disabled = false;
+    }
+  });
+</script>
+
+</body>
+</html>

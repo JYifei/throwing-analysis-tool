@@ -13,7 +13,7 @@ Tennis Detection using YOLOv8 + Mediapipe Pose
 - FIX: Realtime preview and Video Saving restored
 - FEATURE: Auto-extract clips after analysis
 """
-
+from __future__ import annotations
 from ultralytics import YOLO
 import cv2
 import numpy as np
@@ -24,6 +24,14 @@ import matplotlib.pyplot as plt
 from math import ceil
 import os
 import json
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+import sys
+
+_THIS_DIR = Path(__file__).resolve().parent  # .../src
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+
 
 
 
@@ -715,7 +723,9 @@ class TennisDetector:
         ax1.scatter(frames_idx, ball_y, label="Ball Y", color="green", s=10)
         for rf in release_frames: ax1.axvline(x=df.loc[rf, "frame"], color="red", linestyle="--")
         for tsf in throw_start_frames: ax1.axvline(x=df.loc[tsf, "frame"], color="purple", linestyle="--")
-        plt.savefig("hand_ball_y_plot_marked.png")
+        plots_dir = Path(video_dir) / "plots" if video_dir is not None else Path(os.path.dirname(output_path)) / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        plt.savefig(str(plots_dir / "hand_ball_y_plot_marked.png"))
         plt.close()
 
         # =========================================================
@@ -893,176 +903,232 @@ class TennisDetector:
 
         return df, release_frames
 
-if __name__ == "__main__":
-    import os
-    import sys
+def run_once(
+    video_path: str,
+    out_dir: str,
+    reference_csv: str,
+    thresholds_json: str,
+    *,
+    enable_annotation: bool = True,
+    enable_dtw: bool = True,
+    show_realtime: bool = False,
+) -> Dict[str, Any]:
+    """
+    Run the full pipeline for a single input video.
+
+    Returns a dict containing key output paths and summary info for UI.
+    """
+    video_path_p = Path(video_path)
+    out_dir_p = Path(out_dir)
+
+    # 1) Prepare output folders
+    out_dir_p.mkdir(parents=True, exist_ok=True)
+    (out_dir_p / "logs").mkdir(parents=True, exist_ok=True)
+    (out_dir_p / "intermediate").mkdir(parents=True, exist_ok=True)
+    (out_dir_p / "throws").mkdir(parents=True, exist_ok=True)
+
+    # 2) Run detection & FSM segmentation
+    # NOTE: call your existing detect_video() here.
+    # IMPORTANT: Do NOT chdir. Make detect_video write into out_dir_p.
+    events_path = out_dir_p / "events.json"
+    detector = TennisDetector(model_path="yolov8m.pt", confidence=0.15, iou=0.45)
+
+    # If your current detect_video signature is different, keep it as-is,
+    # but pass show_realtime=show_realtime and make sure all outputs go to out_dir_p.
+    detector.detect_video(
+    video_path=str(video_path_p),
+    output_path=str(out_dir_p / "output_detection_with_pose.mp4"),
+    show_realtime=False,
+    use_tracker=False,
+    img_size=1280,
+    video_dir=str(out_dir_p),)
+
+
+    if not events_path.exists():
+        raise FileNotFoundError(f"events.json not found at {events_path}")
+
+    # 3) Optional: annotation from events
+    annotated_video_path: Optional[str] = None
+    if enable_annotation:
+        from annotate_basic import annotate_from_events
+        annotated_video_path = annotate_from_events(out_dir_p)
+
+    # 4) Optional: DTW scoring for each throw
+    summary_scores_path: Optional[str] = None
+    if enable_dtw:
+        summary_scores_path = _run_dtw_and_write_summary(
+            out_dir_p=out_dir_p,
+            reference_csv=Path(reference_csv),
+            thresholds_json=Path(thresholds_json),
+        )
+
+    # 5) Collect known plot outputs (optional)
+    plots_dir = out_dir_p / "plots"
+    plots: List[str] = []
+    if plots_dir.exists():
+        plots = [str(p) for p in sorted(plots_dir.glob("*.png"))]
+
+    # 6) Return to UI
+    return {
+        "video": str(video_path_p),
+        "out_dir": str(out_dir_p),
+        "events_json": str(events_path),
+        "annotated_video": annotated_video_path,
+        "summary_scores": summary_scores_path,
+        "plots": plots,
+    }
+
+def run_single_throw_dtw(
+    sample_csv: str,
+    reference_csv: str,
+    thresholds: dict,
+    out_json: str,
+    *,
+    save_frame_csv: bool = False,
+):
+    from fixed_dtw_comparison import FixedMotionDTW
     import json
     from pathlib import Path
 
+    comparator = FixedMotionDTW(reference_csv, reference_handedness="auto")
+    scores, frame_dists, meta = comparator.compare(
+        student_csv=sample_csv,
+        handedness="auto",
+        save_frame_csv=save_frame_csv
+    )
 
-    # Ensure we can import annotate_basic even after chdir(out_dir)
-    SRC_DIR = Path(__file__).resolve().parent
-    if str(SRC_DIR) not in sys.path:
-        sys.path.insert(0, str(SRC_DIR))
+    features_out = {}
+    for k in comparator.FEATURE_NAMES:
+        if k not in scores:
+            continue
 
+        v = float(scores[k])
+        cfg = thresholds.get(k)
 
-    videos_dir = Path("samples")
-    output_root = Path("output")
-        # ===== Step 6/7 switches =====
-    ENABLE_ANNOTATION = True
-    ENABLE_DTW = True
-    DTW_SAVE_FRAME_CSV = False  # debug only; True will create *_dtw_frame.csv per throw
+        if cfg is None:
+            level = "unknown"
+            warn = bad = None
+        else:
+            warn = float(cfg.get("warn", 0.0))
+            bad = float(cfg.get("bad", 1e9))
+            level = "ok" if v < warn else "warn" if v < bad else "bad"
 
+        features_out[k] = {
+            "value": v,
+            "level": level,
+            "warn": warn,
+            "bad": bad,
+        }
 
-    # Project root (assumes you run: python src/fsm_new.py from project root)
-    PROJECT_ROOT = Path.cwd()
-    REFERENCE_CSV = PROJECT_ROOT / "reference" / "model.csv"
+    score_obj = {
+        "meta": meta,
+        "dtw": {
+            "features": features_out,
+            "overall_matching_score": scores.get("overall_matching_score"),
+        }
+    }
 
-    output_root.mkdir(exist_ok=True)
+    out_path = Path(out_json)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(score_obj, f, indent=2)
 
-    seen = set()
-    video_files = []
-    for ext in ("*.mp4", "*.mov", "*.avi", "*.mkv"):
-        for p in videos_dir.glob(ext):
-            rp = p.resolve()
-            if rp not in seen:
-                seen.add(rp)
-                video_files.append(rp)
-
-    print(f"[INFO] Found {len(video_files)} videos in {videos_dir}")
-    for video_path in video_files:
-        name = video_path.stem              
-        out_dir = (output_root / name).resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"[INFO] Processing: {video_path.name}  ->  {out_dir}")
-
-        old_cwd = Path.cwd()
-        os.chdir(out_dir)
-
-        try:
-            detector = TennisDetector(model_path='yolov8m.pt', confidence=0.15, iou=0.45)
-            df, release_frames = detector.detect_video(
-                video_path=str(video_path),
-                output_path='output_detection_with_pose.mp4',
-                show_realtime=True,
-                use_tracker=False,
-                img_size=1280,
-                video_dir=str(out_dir)  # 先用现有 out_dir 做验证
-            )
-                        # ===== Step 6: annotation (basic) =====
-            if ENABLE_ANNOTATION:
-                try:
-                    from annotate_basic import annotate_from_events
-                    annotate_from_events(out_dir)
-                    print(f"[ANNOTATE] Done: {out_dir}")
-                except Exception as e:
-                    print(f"[ANNOTATE] Failed: {e}")
-
-            # ===== Step 7: DTW scoring from events.json =====
-            if ENABLE_DTW:
-                try:
-                    from fixed_dtw_comparison import FixedMotionDTW
-
-                    events_path = Path(out_dir) / "events.json"
-                    if not events_path.exists():
-                        raise FileNotFoundError(f"Missing events.json: {events_path}")
-
-                    if not REFERENCE_CSV.exists():
-                        raise FileNotFoundError(f"Missing reference CSV: {REFERENCE_CSV}")
-
-                    with open(events_path, "r", encoding="utf-8") as f:
-                        events_obj = json.load(f)
-
-                    comparator = FixedMotionDTW(str(REFERENCE_CSV), reference_handedness="auto")
-                    # Load per-feature DTW thresholds (debug thresholds ok)
-                    thresholds_path = PROJECT_ROOT / "config" / "dtw_thresholds.json"
-                    with open(thresholds_path, "r", encoding="utf-8") as tf:
-                        thresholds = json.load(tf)
-
-
-                    for ev in events_obj.get("events", []):
-                        if ev.get("status") != "ok":
-                            continue
-
-                        throw_id = ev.get("throw_id")
-                        throw_dir = Path(out_dir) / ev.get("throw_dir", "")
-                        clip_csv = Path(out_dir) / ev.get("clip_csv", "")
-
-                        if not clip_csv.exists():
-                            print(f"[DTW] throw_{throw_id:03d}: missing clip_csv -> {clip_csv}")
-                            continue
-
-                        scores, frame_dists, meta = comparator.compare(
-                            student_csv=str(clip_csv),
-                            handedness="auto",
-                            save_frame_csv=DTW_SAVE_FRAME_CSV
-                        )
-
-                                                # Build per-feature output with level based on thresholds.json
-                        features_out = {}
-                        for k in comparator.FEATURE_NAMES:
-                            v = scores.get(k)
-                            if v is None:
-                                continue
-
-                            cfg = thresholds.get(k)
-                            if cfg is None:
-                                # If missing in json, do not crash; mark as "unknown"
-                                features_out[k] = {
-                                    "value": v,
-                                    "level": "unknown"
-                                }
-                                continue
-
-                            warn = float(cfg.get("warn", 0.0))
-                            bad = float(cfg.get("bad", 1e9))
-                            ftype = cfg.get("type", "unknown")
-
-                            if v >= bad:
-                                level = "bad"
-                            elif v >= warn:
-                                level = "warn"
-                            else:
-                                level = "ok"
-
-                            features_out[k] = {
-                                "type": ftype,
-                                "value": float(v),
-                                "level": level,
-                                "warn": warn,
-                                "bad": bad
-                            }
-
-                        score_obj = {
-                            "throw_id": throw_id,
-                            "status": ev.get("status", "ok"),
-                            "window": {
-                                "start_frame": ev.get("start_frame"),
-                                "release_frame": ev.get("release_frame"),
-                                "end_frame": ev.get("end_frame"),
-                            },
-                            "meta": meta,
-                            "dtw": {
-                                "features": features_out,
-                                "overall_matching_score": scores.get("overall_matching_score"),
-                            },
-                        }
-
-
-                        throw_dir.mkdir(parents=True, exist_ok=True)
-                        score_path = throw_dir / "score.json"
-                        with open(score_path, "w", encoding="utf-8") as wf:
-                            json.dump(score_obj, wf, ensure_ascii=False, indent=2)
-
-                        print(f"[DTW] throw_{throw_id:03d} -> {score_path}")
-
-                    print(f"[DTW] Done: {out_dir}")
-
-                except Exception as e:
-                    print(f"[DTW] Failed: {e}")
+    return score_obj
 
 
 
-        finally:
-            os.chdir(old_cwd)
+
+def _run_dtw_and_write_summary(
+    out_dir_p: Path,
+    reference_csv: Path,
+    thresholds_json: Path,
+) -> str:
+    """
+    Reads events.json, runs DTW per ok throw, writes:
+    - throws/throw_xxx/score.json (existing behavior)
+    - outputs/scores_summary.json (new; for UI table)
+    Returns path to the summary json.
+    """
+    events_path = out_dir_p / "events.json"
+    with events_path.open("r", encoding="utf-8") as f:
+        events_obj = json.load(f)
+
+    thresholds = {}
+    if thresholds_json.exists():
+        with thresholds_json.open("r", encoding="utf-8") as f:
+            thresholds = json.load(f)
+
+    throws = events_obj.get("events", [])
+    summary_rows = []
+
+    for t in throws:
+        if t.get("status") != "ok":
+            continue
+
+        throw_id = t.get("throw_id")
+        ev = t
+        throw_dir = out_dir_p / ev["throw_dir"]
+        clip_csv = out_dir_p / ev["clip_csv"]
+        score_path = throw_dir / "score.json"
+        if not clip_csv.exists():
+            # record as missing but do not crash the whole job
+            summary_rows.append({
+                "throw_id": throw_id,
+                "status": "failed",
+                "reason": f"missing clip_csv: {clip_csv}",
+            })
+            continue
+
+        # ---- Call your existing DTW compare logic here ----
+        # Example:
+        # dtw = FixedMotionDTW(reference_csv=str(reference_csv), thresholds=thresholds)
+        # score_obj = dtw.compare(sample_csv=str(clip_csv), out_json=str(score_path))
+        #
+        # IMPORTANT: keep the original logic, just ensure paths are absolute.
+
+        score_obj = run_single_throw_dtw(
+            sample_csv=str(clip_csv),
+            reference_csv=str(reference_csv),
+            thresholds=thresholds,
+            out_json=str(score_path),
+        )
+
+        # Build UI-friendly row
+        row = {
+            "throw_id": throw_id,
+            "start_frame": t.get("start_frame"),
+            "release_frame": t.get("release_frame"),
+            "end_frame": t.get("end_frame"),
+            "score_json": str(score_path),
+            "status": "ok",
+        }
+        # if score_obj contains an overall score, attach it
+        if isinstance(score_obj, dict):
+            row["overall_matching_score"] = (score_obj.get("dtw") or {}).get("overall_matching_score")
+        summary_rows.append(row)
+
+    outputs_dir = out_dir_p / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = outputs_dir / "scores_summary.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump({"rows": summary_rows}, f, ensure_ascii=False, indent=2)
+
+    return str(summary_path)
+
+
+if __name__ == "__main__":
+    import json
+
+    video = "samples/your_test_video.mp4"
+    out_dir = "runs/local_test"
+
+    result = run_once(
+        video_path=video,
+        out_dir=out_dir,
+        reference_csv="reference/model.csv",
+        thresholds_json="config/dtw_thresholds.json",
+        enable_annotation=True,
+        enable_dtw=True,
+    )
+
+    print(json.dumps(result, indent=2))

@@ -36,3 +36,13 @@ logs/
 # ===== IDE =====
 .vscode/
 .idea/
+
+# Runtime outputs
+runs/
+*.zip
+output/
+
+
+# Virtual environments
+.venv/
+venv/

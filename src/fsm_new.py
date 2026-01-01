@@ -27,11 +27,92 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 import sys
+import re
+import subprocess
 
 _THIS_DIR = Path(__file__).resolve().parent  # .../src
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+
+
+def ensure_browser_mp4(mp4_path: Path, ffmpeg_bin: str = "ffmpeg") -> bool:
+    """
+    Normalize an MP4 file for browser playback:
+    - H.264 (libx264)
+    - yuv420p pixel format
+    - faststart (moov atom at beginning)
+    - drop audio (-an) for maximum compatibility
+    Returns True if succeeded, False otherwise.
+    """
+    mp4_path = Path(mp4_path)
+    if not mp4_path.exists():
+        print(f"[WARN] ensure_browser_mp4: file not found: {mp4_path}")
+        return False
+
+    # temp output in same directory (atomic replace on success)
+    tmp_path = mp4_path.with_suffix(".tmp.mp4")
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i", str(mp4_path),
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-an",
+        str(tmp_path),
+    ]
+
+    try:
+        # Hide a huge amount of ffmpeg output unless error
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            print("[WARN] ensure_browser_mp4 failed:")
+            print("  file:", mp4_path)
+            print("  cmd :", " ".join(cmd))
+            # Print last ~30 lines of stderr for debugging
+            err_lines = (completed.stderr or "").splitlines()
+            tail = "\n".join(err_lines[-30:])
+            print("  ffmpeg stderr tail:\n", tail)
+            # cleanup tmp
+            if tmp_path.exists():
+                try: tmp_path.unlink()
+                except Exception: pass
+            return False
+
+        # Replace original atomically
+        try:
+            os.replace(str(tmp_path), str(mp4_path))
+        except Exception as e:
+            print(f"[WARN] ensure_browser_mp4 os.replace failed: {e}")
+            # cleanup tmp
+            if tmp_path.exists():
+                try: tmp_path.unlink()
+                except Exception: pass
+            return False
+
+        print(f"[INFO] ensure_browser_mp4 OK: {mp4_path}")
+        return True
+
+    except FileNotFoundError:
+        print(f"[WARN] ensure_browser_mp4: ffmpeg not found: {ffmpeg_bin}")
+        return False
+    except Exception as e:
+        print(f"[WARN] ensure_browser_mp4 unexpected error: {type(e).__name__}: {e}")
+        # cleanup tmp
+        if tmp_path.exists():
+            try: tmp_path.unlink()
+            except Exception: pass
+        return False
 
 
 
@@ -881,6 +962,9 @@ class TennisDetector:
                     out_clip.write(frame_c)
                 
                 out_clip.release()
+                # Normalize for browser playback
+                ensure_browser_mp4(Path(clip_path))
+
             
             cap_clip.release()
             # --- write events.json (video-level index) ---
@@ -946,14 +1030,7 @@ def run_once(
 
     if not events_path.exists():
         raise FileNotFoundError(f"events.json not found at {events_path}")
-
-    # 3) Optional: annotation from events
-    annotated_video_path: Optional[str] = None
-    if enable_annotation:
-        from annotate_basic import annotate_from_events
-        annotated_video_path = annotate_from_events(out_dir_p)
-
-    # 4) Optional: DTW scoring for each throw
+    # 3) Optional: DTW scoring for each throw
     summary_scores_path: Optional[str] = None
     if enable_dtw:
         summary_scores_path = _run_dtw_and_write_summary(
@@ -962,11 +1039,26 @@ def run_once(
             thresholds_json=Path(thresholds_json),
         )
 
+    # 4) Optional: annotation from events
+    annotated_video_path: Optional[str] = None
+    if enable_annotation:
+        from annotate_basic import annotate_from_events
+        annotated_video_path = annotate_from_events(out_dir_p)
+
+    
     # 5) Collect known plot outputs (optional)
     plots_dir = out_dir_p / "plots"
     plots: List[str] = []
     if plots_dir.exists():
         plots = [str(p) for p in sorted(plots_dir.glob("*.png"))]
+
+    # --- generate manifest for UI ---
+    try:
+        mp = write_manifest(out_dir_p)
+        print(f"[INFO] manifest saved: {mp}")
+    except Exception as e:
+        print(f"[WARN] Failed to generate manifest: {type(e).__name__}: {e}")
+
 
     # 6) Return to UI
     return {
@@ -1114,6 +1206,84 @@ def _run_dtw_and_write_summary(
         json.dump({"rows": summary_rows}, f, ensure_ascii=False, indent=2)
 
     return str(summary_path)
+
+def build_manifest(job_dir: Path) -> dict:
+    """
+    Build manifest.json for a completed job.
+    Keeps entries even if some files are missing.
+    """
+    job_id = job_dir.name
+    throws_dir = job_dir / "throws"
+    outputs_dir = job_dir / "outputs"
+
+    throw_pattern = re.compile(r"^throw_(\d{3})$")
+
+    throw_dirs = []
+    for p in throws_dir.iterdir():
+        if p.is_dir():
+            m = throw_pattern.match(p.name)
+            if m:
+                throw_dirs.append((int(m.group(1)), p.name))
+
+    throw_dirs.sort(key=lambda x: x[0])
+
+    throws = []
+
+    for idx, (_, throw_id) in enumerate(throw_dirs, start=1):
+        local_throw_dir = throws_dir / throw_id
+
+        video_path = local_throw_dir / "clip.mp4"
+        score_path = local_throw_dir / "score.json"
+
+        missing = []
+        if not video_path.exists():
+            missing.append("video")
+        if not score_path.exists():
+            missing.append("score")
+
+        if not missing:
+            status = "ok"
+        elif len(missing) == 2:
+            status = "missing_all"
+        else:
+            status = "partial"
+
+        throws.append({
+            "throw_id": throw_id,
+            "index": idx,
+            "video": f"/runs/{job_id}/throws/{throw_id}/clip.mp4",
+            "score": f"/runs/{job_id}/throws/{throw_id}/score.json",
+            "status": status,
+            "missing": missing
+        })
+
+    manifest = {
+        "job_id": job_id,
+        "num_throws": len(throws),
+        "summary_scores": f"/runs/{job_id}/outputs/scores_summary.json",
+        "throws": throws
+    }
+
+    return manifest
+
+
+def write_manifest(job_dir: Path) -> Path:
+    """
+    Write manifest.json to outputs directory.
+    Never raises to avoid failing the job.
+    """
+    outputs_dir = job_dir / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = outputs_dir / "manifest.json"
+
+    manifest = build_manifest(job_dir)
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    return manifest_path
+
 
 
 if __name__ == "__main__":

@@ -6,267 +6,491 @@
   <title>Throwing Analysis Tool</title>
 
   <style>
-    body {
-      font-family: system-ui, -apple-system, Segoe UI, Arial, sans-serif;
-      margin: 16px;
-      background: #fafafa;
-    }
-    h1 { margin-bottom: 4px; }
-    .muted { color: #666; font-size: 12px; }
+    :root { --border:#e5e7eb; --muted:#6b7280; --bg:#fafafa; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Arial, sans-serif; margin:0; background:var(--bg); color:#111827; }
+    header { padding:16px 20px; border-bottom:1px solid var(--border); background:white; }
+    header h1 { margin:0; font-size:18px; }
+    header .sub { margin-top:6px; font-size:13px; color:var(--muted); }
 
-    .row {
-      display: flex;
-      gap: 16px;
-      align-items: flex-start;
-      flex-wrap: wrap;
-      margin-top: 16px;
-    }
+    .wrap { display:grid; grid-template-columns: 360px 1fr; gap:16px; padding:16px; max-width:1280px; margin:0 auto; }
+    .card { background:white; border:1px solid var(--border); border-radius:10px; padding:14px; }
+    .card h2 { margin:0 0 10px; font-size:14px; }
+    .muted { color:var(--muted); font-size:12px; }
 
-    .card {
-      border: 1px solid #ddd;
-      border-radius: 10px;
-      padding: 12px;
-      background: #fff;
-    }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .btn { padding:8px 12px; border:1px solid #111827; border-radius:8px; background:#111827; color:#fff; cursor:pointer; }
+    .btn.secondary { background:#fff; color:#111827; border-color:var(--border); }
+    .btn:disabled { opacity:0.5; cursor:not-allowed; }
 
-    .card h2 {
-      margin: 0 0 8px 0;
-      font-size: 16px;
-    }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); font-size:12px; background:#fff; }
+    .pill.ok { background:#ecfdf5; border-color:#a7f3d0; }
+    .pill.partial { background:#fffbeb; border-color:#fde68a; }
+    .pill.missing_all { background:#fef2f2; border-color:#fecaca; }
+    .pill.running { background:#eff6ff; border-color:#bfdbfe; }
+    .pill.failed { background:#fef2f2; border-color:#fecaca; }
 
-    table {
-      border-collapse: collapse;
-      width: 100%;
-      font-size: 13px;
-    }
+    .list { display:flex; flex-direction:column; gap:8px; max-height: 540px; overflow:auto; padding-right:4px; margin-top:10px; }
+    .item { border:1px solid var(--border); border-radius:10px; padding:10px; cursor:pointer; background:white; }
+    .item:hover { background:#f9fafb; }
+    .item.active { border-color:#111827; box-shadow: 0 0 0 2px rgba(17,24,39,0.08); }
+    .item .top { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .item .name { font-weight:600; font-size:13px; }
+    .item .meta { margin-top:6px; font-size:12px; color:var(--muted); }
 
-    th, td {
-      border: 1px solid #ddd;
-      padding: 6px 8px;
-      vertical-align: top;
-    }
+    .main { display:flex; flex-direction:column; gap:16px; }
+    video { width:100%; border-radius:10px; border:1px solid var(--border); background:black; }
 
-    th {
-      background: #f4f4f4;
-      text-align: left;
-    }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { border-bottom:1px solid var(--border); padding:8px 6px; text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-weight:600; width: 40%; }
 
-    img {
-      max-width: 520px;
-      height: auto;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      margin-bottom: 10px;
-    }
+    .links a { font-size:13px; color:#1d4ed8; text-decoration:none; }
+    .links a:hover { text-decoration:underline; }
 
-    .btn {
-      padding: 8px 12px;
-      border: 1px solid #333;
-      border-radius: 8px;
-      background: #111;
-      color: #fff;
-      cursor: pointer;
-    }
+    .toggle { display:inline-flex; border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+    .toggle button { border:0; padding:8px 10px; background:#fff; cursor:pointer; font-size:12px; color:#111827; }
+    .toggle button.active { background:#111827; color:#fff; }
+    .table-wrap { overflow:auto; border:1px solid var(--border); border-radius:10px; background:#fff; }
+    .tbl { width:100%; border-collapse:collapse; font-size:13px; }
+    .tbl thead th { text-align:left; padding:10px 12px; background:#f9fafb; border-bottom:1px solid var(--border); color:var(--muted); font-weight:600; }
+    .tbl td { padding:10px 12px; border-bottom:1px solid #f1f5f9; vertical-align: top; }
+    .tbl tr:last-child td { border-bottom:none; }
 
-    .btn:disabled {
-      background: #888;
-      border-color: #888;
-      cursor: not-allowed;
-    }
+    .badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:800; border:1px solid var(--border); }
+    .badge.ok { background:#ecfdf5; border-color:#a7f3d0; color:#065f46; }
+    .badge.warn { background:#fffbeb; border-color:#fde68a; color:#92400e; }
+    .badge.bad { background:#fef2f2; border-color:#fecaca; color:#991b1b; }
 
-    code {
-      background: #f4f4f4;
-      padding: 2px 4px;
-      border-radius: 6px;
-    }
+    .score-summary { padding:10px 12px; border:1px solid var(--border); border-radius:10px; background:#f9fafb; }
+
   </style>
 </head>
 
 <body>
+  <header>
+    <h1>Throwing Analysis Tool</h1>
+    <div class="sub">Upload a video → run analysis → browse throws (annotated preview + per-throw scores).</div>
+  </header>
 
-  <h1>Throwing Analysis Tool</h1>
-  <p class="muted">
-    Upload a video to run the analysis. The system will generate clips, scores, and plots.
-  </p>
+  <div class="wrap">
+    <!-- LEFT -->
+    <div class="card">
+      <h2>1) Upload and Run</h2>
 
-  <!-- Step 1 -->
-  <div class="card">
-    <h2>1) Upload and Run Analysis</h2>
+      <form id="jobForm">
+        <div style="margin-bottom:10px;">
+          <input id="videoFile" type="file" accept="video/*" required />
+        </div>
 
-    <form id="jobForm">
-      <div style="margin-bottom:10px;">
-        <input id="videoFile" type="file" accept="video/*" required />
+        <div class="row" style="margin-bottom:10px;">
+          <label class="muted">
+            <input id="enableDTW" type="checkbox" checked />
+            Enable DTW Scoring
+          </label>
+          <label class="muted">
+            <input id="enableAnno" type="checkbox" checked />
+            Enable Video Annotation
+          </label>
+        </div>
+
+        <div class="row">
+          <button id="runBtn" class="btn" type="submit">Run Analysis</button>
+          <button id="resetBtn" class="btn secondary" type="button">Reset</button>
+          <span id="statusPill" class="pill">idle</span>
+        </div>
+
+        <div class="muted" id="statusText" style="margin-top:10px;">Ready.</div>
+      </form>
+
+      <div class="links" id="jobLinks" style="margin-top:12px;"></div>
+
+      <hr style="border:none;border-top:1px solid var(--border); margin:14px 0;" />
+
+      <h2>2) Throws</h2>
+      <div class="muted">Select a throw to preview its video and score.json.</div>
+      <div class="list" id="throwList">
+        <div class="muted">No job loaded.</div>
+      </div>
+    </div>
+
+    <!-- RIGHT -->
+    <div class="main">
+      <div class="card">
+        <div class="row" style="justify-content:space-between;">
+          <h2 style="margin:0;">Preview</h2>
+          <div class="row" style="gap:12px;">
+            <div class="toggle" title="Preview mode">
+              <button id="modeAnnotated" type="button" class="active">Annotated</button>
+              <button id="modeClip" type="button">Clip</button>
+            </div>
+            <div id="selectedInfo" class="muted">No throw selected.</div>
+          </div>
+        </div>
+
+        <div style="margin-top:10px;">
+          <video id="player" controls preload="metadata"></video>
+        </div>
+        <div id="videoHint" class="muted" style="margin-top:8px;"></div>
+        <div id="videoErr" class="muted" style="margin-top:6px; color:#b91c1c;"></div>
       </div>
 
-      <div style="display:flex; gap:16px; align-items:center; margin-bottom:10px;">
-        <label>
-          <input id="enableDTW" type="checkbox" checked />
-          Enable DTW Scoring
-        </label>
-        <label>
-          <input id="enableAnno" type="checkbox" />
-          Enable Video Annotation
-        </label>
-      </div>
-
-      <button id="runBtn" class="btn" type="submit">Run Analysis</button>
-      <span id="statusText" class="muted" style="margin-left:10px;"></span>
-    </form>
-  </div>
-
-  <!-- Step 2 -->
-  <div class="row">
-    <div class="card" style="flex: 1 1 720px;">
-      <h2>2) Job Overview</h2>
-      <div id="jobMeta" class="muted">Not started yet.</div>
-      <div style="margin-top:10px;">
-        <a id="downloadLink" class="btn" href="#" style="display:none; text-decoration:none;">
-          Download results.zip
-        </a>
+      <div class="card">
+        <h2>Scores (per throw)</h2>
+        <div id="scoreBox" class="muted">No throw selected.</div>
       </div>
     </div>
   </div>
 
-  <!-- Step 3 & 4 -->
-  <div class="row">
-    <div class="card" style="flex: 1 1 720px;">
-      <h2>3) Scores Summary</h2>
-      <div id="scoresArea" class="muted">Waiting for analysis results…</div>
-    </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
 
-    <div class="card" style="flex: 1 1 520px;">
-      <h2>4) Plots</h2>
-      <div id="plotsArea" class="muted">Waiting for analysis results…</div>
-    </div>
-  </div>
+    let currentJob = null;      // {job_id, status, result, job_url, download_url}
+    let manifest = null;        // manifest.json object
+    let selectedThrow = null;   // one entry from manifest.throws
+    let previewMode = "annotated"; // "annotated" | "clip" (default annotated)
 
-<script>
-  const form = document.getElementById("jobForm");
-  const runBtn = document.getElementById("runBtn");
-  const statusText = document.getElementById("statusText");
-  const jobMeta = document.getElementById("jobMeta");
-  const downloadLink = document.getElementById("downloadLink");
-  const scoresArea = document.getElementById("scoresArea");
-  const plotsArea = document.getElementById("plotsArea");
+    function setStatus(label, pillClass=null, detail=null) {
+      const pill = $("statusPill");
+      pill.className = "pill" + (pillClass ? " " + pillClass : "");
+      pill.textContent = label;
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, m =>
-      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])
-    );
-  }
-
-  function toRelRunsPath(absPath) {
-    const p = String(absPath);
-    const idx = p.toLowerCase().lastIndexOf("\\runs\\");
-    if (idx >= 0) {
-      return "/runs/" + p.substring(idx + 6).replaceAll("\\", "/");
+      if (detail !== null) $("statusText").textContent = detail;
     }
-    const idx2 = p.toLowerCase().lastIndexOf("/runs/");
-    if (idx2 >= 0) return p.substring(idx2);
-    return null;
-  }
 
-  function renderTable(rows) {
-    if (!rows || rows.length === 0) {
-      return "<div class='muted'>scores_summary.json is empty.</div>";
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, m =>
+        ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])
+      );
     }
 
-    const cols = new Set();
-    rows.forEach(r => Object.keys(r).forEach(k => cols.add(k)));
-    const colList = Array.from(cols);
+    function fmtThrowName(t) {
+      const m = /throw_(\d+)/.exec(t.throw_id || "");
+      if (!m) return t.throw_id || "Throw";
+      return `Throw ${parseInt(m[1], 10)}`;
+    }
 
-    let html = "<table><thead><tr>";
-    colList.forEach(c => html += "<th>" + escapeHtml(c) + "</th>");
-    html += "</tr></thead><tbody>";
+    function pillForStatus(s) {
+      if (s === "ok") return `<span class="pill ok">ok</span>`;
+      if (s === "partial") return `<span class="pill partial">partial</span>`;
+      if (s === "missing_all") return `<span class="pill missing_all">missing</span>`;
+      return `<span class="pill">${escapeHtml(s || "unknown")}</span>`;
+    }
 
-    rows.forEach(r => {
-      html += "<tr>";
-      colList.forEach(c => {
-        let v = r[c];
-        if (typeof v === "object" && v !== null) v = JSON.stringify(v);
-        html += "<td>" + escapeHtml(v ?? "") + "</td>";
-      });
-      html += "</tr>";
-    });
+    async function safeFetchJson(url) {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+      return await res.json();
+    }
 
-    html += "</tbody></table>";
-    return html;
-  }
+    function buildLinks(job) {
+      if (!job) return "";
+      const parts = [];
+      if (job.job_url) parts.push(`<div><a href="${job.job_url}" target="_blank">Open job JSON</a></div>`);
+      if (job.download_url) parts.push(`<div><a href="${job.download_url}" target="_blank">Download results.zip</a></div>`);
+      if (job.job_id) parts.push(`<div class="muted">job_id: <code>${escapeHtml(job.job_id)}</code></div>`);
+      return parts.join("");
+    }
 
-  async function fetchJson(url) {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error("Failed to fetch " + url);
-    return await resp.json();
-  }
-
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-
-    const file = document.getElementById("videoFile").files[0];
-    if (!file) return;
-
-    runBtn.disabled = true;
-    statusText.textContent = "Uploading and running analysis…";
-    jobMeta.textContent = "Running…";
-    scoresArea.innerHTML = "<div class='muted'>Running…</div>";
-    plotsArea.innerHTML = "<div class='muted'>Running…</div>";
-    downloadLink.style.display = "none";
-
-    try {
-      const fd = new FormData();
-      fd.append("video", file);
-      fd.append("enable_dtw", document.getElementById("enableDTW").checked);
-      fd.append("enable_annotation", document.getElementById("enableAnno").checked);
-
-      const resp = await fetch("/api/jobs", { method: "POST", body: fd });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.detail || "Job failed");
-
-      statusText.textContent = "Completed";
-      jobMeta.innerHTML = `
-        <div>job_id: <code>${escapeHtml(data.job_id)}</code></div>
-        <div class="muted">out_dir: ${escapeHtml(data.result.out_dir)}</div>
-      `;
-
-      downloadLink.href = data.download_url;
-      downloadLink.style.display = "inline-block";
-
-      // Plots
-      const plots = data.result.plots || [];
-      if (plots.length === 0) {
-        plotsArea.innerHTML = "<div class='muted'>No plots generated.</div>";
-      } else {
-        plotsArea.innerHTML = plots.map(p => {
-          const rel = toRelRunsPath(p);
-          return rel
-            ? `<img src="${rel}" alt="plot" />`
-            : `<div class="muted">Invalid plot path: ${escapeHtml(p)}</div>`;
-        }).join("");
+    function renderThrowList() {
+      const el = $("throwList");
+      if (!manifest || !manifest.throws || manifest.throws.length === 0) {
+        el.innerHTML = `<div class="muted">No throws found.</div>`;
+        return;
       }
+
+      el.innerHTML = "";
+      manifest.throws.forEach((t) => {
+        const div = document.createElement("div");
+        div.className = "item" + (selectedThrow && selectedThrow.throw_id === t.throw_id ? " active" : "");
+        const missingText = (t.missing && t.missing.length) ? `Missing: ${t.missing.join(", ")}` : "Files: ok";
+        div.innerHTML = `
+          <div class="top">
+            <div class="name">${escapeHtml(fmtThrowName(t))} <span class="muted">(${escapeHtml(t.throw_id)})</span></div>
+            <div>${pillForStatus(t.status)}</div>
+          </div>
+          <div class="meta">${escapeHtml(missingText)}</div>
+        `;
+        div.onclick = () => selectThrow(t.throw_id);
+        el.appendChild(div);
+      });
+    }
+
+    function fmtNumber(x, digits = 6) {
+      if (x === null || x === undefined) return "-";
+      if (typeof x !== "number" || Number.isNaN(x)) return String(x);
+      return x.toFixed(digits);
+    }
+
+    function levelBadge(level) {
+      const lv = String(level || "ok").toLowerCase();
+      const cls = lv === "bad" ? "badge bad" : (lv === "warn" ? "badge warn" : "badge ok");
+      return `<span class="${cls}">${escapeHtml(lv.toUpperCase())}</span>`;
+    }
+
+    function renderScoreTable(scoreObj) {
+      if (!scoreObj || typeof scoreObj !== "object") {
+        return `<div class="muted">Invalid score format.</div>`;
+      }
+
+      const meta = scoreObj.meta || {};
+      const dtw = scoreObj.dtw || {};
+      const feats = (dtw && dtw.features) ? dtw.features : {};
+
+      const overall = feats.overall_matching_score;
+
+      // ----- Meta rows -----
+      const metaKeys = Object.keys(meta).sort();
+      const metaRows = metaKeys.length
+        ? metaKeys.map(k => `<tr><td><code>${escapeHtml(k)}</code></td><td>${escapeHtml(String(meta[k]))}</td></tr>`).join("")
+        : `<tr><td class="muted" colspan="2">No meta available.</td></tr>`;
+
+      // ----- DTW feature rows -----
+      const featNames = Object.keys(feats).filter(n => n !== "overall_matching_score").sort();
+      const featRows = featNames.length
+        ? featNames.map(name => {
+            const f = feats[name] || {};
+            const thresholds = [
+              (f.warn !== undefined ? `warn ≤ ${fmtNumber(f.warn, 4)}` : null),
+              (f.bad  !== undefined ? `bad ≤ ${fmtNumber(f.bad, 4)}`  : null),
+            ].filter(Boolean).join(" · ");
+            return `
+              <tr>
+                <td><code>${escapeHtml(name)}</code></td>
+                <td>${escapeHtml(fmtNumber(f.value, 6))}</td>
+                <td>${levelBadge(f.level)}</td>
+                <td class="muted">${escapeHtml(thresholds || "-")}</td>
+              </tr>
+            `;
+          }).join("")
+        : `<tr><td class="muted" colspan="4">No DTW features available.</td></tr>`;
+
+      return `
+        <div class="score-summary">
+          <div class="muted" style="font-size:12px;">Overall matching score</div>
+          <div style="font-size:18px; font-weight:800; margin-top:2px;">${escapeHtml(fmtNumber(overall, 6))}</div>
+        </div>
+
+        <div style="margin-top:10px;">
+          <div style="font-weight:700; font-size:13px; margin: 8px 0;">Meta</div>
+          <div class="table-wrap">
+            <table class="tbl">
+              <thead><tr><th style="width:240px;">Key</th><th>Value</th></tr></thead>
+              <tbody>${metaRows}</tbody>
+            </table>
+          </div>
+        </div>
+
+        <div style="margin-top:12px;">
+          <div style="font-weight:700; font-size:13px; margin: 8px 0;">DTW Features</div>
+          <div class="table-wrap">
+            <table class="tbl">
+              <thead>
+                <tr>
+                  <th style="width:260px;">Feature</th>
+                  <th style="width:140px;">Value</th>
+                  <th style="width:120px;">Level</th>
+                  <th>Thresholds</th>
+                </tr>
+              </thead>
+              <tbody>${featRows}</tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }
+
+
+    function setPreviewMode(mode) {
+      previewMode = mode;
+      $("modeAnnotated").classList.toggle("active", mode === "annotated");
+      $("modeClip").classList.toggle("active", mode === "clip");
+      // refresh current selection
+      if (selectedThrow) updateVideoSource(selectedThrow);
+    }
+
+    function deriveAnnotatedUrlFromClipUrl(clipUrl) {
+      // clip.mp4 -> annotated.mp4
+      if (!clipUrl) return null;
+      return clipUrl.replace(/\/clip\.mp4(\?.*)?$/i, "/annotated.mp4");
+    }
+
+    async function updateVideoSource(t) {
+      const player = $("player");
+      const hint = $("videoHint");
+
+      // Choose URL based on preview mode.
+      // - In manifest v1, t.video points to clip.mp4. We'll derive annotated path.
+      // - We add a cache-busting query to avoid 304 issues in <video>.
+      let clipUrl = t.video;
+      let annotatedUrl = deriveAnnotatedUrlFromClipUrl(clipUrl);
+
+      // Local missing logic based on manifest "missing"
+      const hasVideo = !(t.missing && t.missing.includes("video"));
+
+      if (!hasVideo) {
+        player.removeAttribute("src");
+        player.load();
+        hint.textContent = "Video file missing for this throw.";
+        return;
+      }
+
+      // Default: annotated, but if annotated 404 then fallback to clip.
+      let primary = (previewMode === "annotated") ? annotatedUrl : clipUrl;
+      let fallback = (previewMode === "annotated") ? clipUrl : annotatedUrl;
+
+      // Add cache-busting
+      const bust = `v=${Date.now()}`;
+      const primaryUrl = primary + (primary.includes("?") ? "&" : "?") + bust;
+      const fallbackUrl = fallback + (fallback.includes("?") ? "&" : "?") + bust;
+
+      // Try primary HEAD fetch to confirm it exists
+      try {
+        const r = await fetch(primary, { method: "HEAD", cache: "no-store" });
+        if (!r.ok) throw new Error(`HEAD ${r.status}`);
+        player.src = primaryUrl;
+        player.load();
+        hint.textContent = (previewMode === "annotated")
+          ? "Previewing annotated.mp4 (auto-fallback to clip if missing)."
+          : "Previewing clip.mp4.";
+        return;
+      } catch (_) {
+        // fallback
+        try {
+          const r2 = await fetch(fallback, { method: "HEAD", cache: "no-store" });
+          if (!r2.ok) throw new Error(`HEAD ${r2.status}`);
+          player.src = fallbackUrl;
+          player.load();
+          hint.textContent = "Primary preview file missing; fell back to the other video.";
+          return;
+        } catch (e2) {
+          player.removeAttribute("src");
+          player.load();
+          hint.textContent = "Unable to load video (both annotated and clip unavailable).";
+        }
+      }
+    }
+
+    async function selectThrow(throwId) {
+      if (!manifest || !manifest.throws) return;
+      const t = manifest.throws.find(x => x.throw_id === throwId);
+      if (!t) return;
+      selectedThrow = t;
+
+      renderThrowList();
+      $("selectedInfo").textContent = `${fmtThrowName(t)} • ${t.throw_id} • status=${t.status}`;
+
+      // Video
+      await updateVideoSource(t);
 
       // Scores
-      const summaryAbs = data.result.summary_scores;
-      const summaryRel = summaryAbs ? toRelRunsPath(summaryAbs) : null;
-      if (!summaryRel) {
-        scoresArea.innerHTML = "<div class='muted'>scores_summary.json not found.</div>";
+      if (t.missing && t.missing.includes("score")) {
+        $("scoreBox").innerHTML = `<div class="muted">Score file missing.</div>`;
       } else {
-        const summary = await fetchJson(summaryRel);
-        const rows = Array.isArray(summary)
-          ? summary
-          : (summary.rows || summary.data || []);
-        scoresArea.innerHTML = renderTable(rows);
+        try {
+          const score = await safeFetchJson(t.score);
+          $("scoreBox").innerHTML = renderScoreTable(score);
+        } catch (e) {
+          $("scoreBox").innerHTML = `<div class="muted">Failed to load score: ${escapeHtml(e.message)}</div>`;
+        }
       }
-
-    } catch (err) {
-      statusText.textContent = "Failed: " + err;
-      jobMeta.textContent = "Job failed. Check backend logs.";
-      scoresArea.innerHTML = "<div class='muted'>Failed.</div>";
-      plotsArea.innerHTML = "<div class='muted'>Failed.</div>";
-    } finally {
-      runBtn.disabled = false;
     }
-  });
-</script>
 
+    async function loadManifest(jobId) {
+      const url = `/runs/${jobId}/outputs/manifest.json`;
+      manifest = await safeFetchJson(url);
+      renderThrowList();
+      if (manifest.throws && manifest.throws.length) {
+        await selectThrow(manifest.throws[0].throw_id);
+      } else {
+        $("selectedInfo").textContent = "No throws found.";
+      }
+    }
+
+    function resetUI() {
+      currentJob = null;
+      manifest = null;
+      selectedThrow = null;
+      $("videoFile").value = "";
+      $("jobLinks").innerHTML = "";
+      $("throwList").innerHTML = `<div class="muted">No job loaded.</div>`;
+      $("selectedInfo").textContent = "No throw selected.";
+      $("player").removeAttribute("src");
+      $("player").load();
+      $("scoreBox").textContent = "No throw selected.";
+      $("videoHint").textContent = "";
+      setPreviewMode("annotated");
+      setStatus("idle", null, "Ready.");
+    }
+
+    $("modeAnnotated").onclick = () => setPreviewMode("annotated");
+    $("modeClip").onclick = () => setPreviewMode("clip");
+
+    $("resetBtn").onclick = () => resetUI();
+
+    $("jobForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+
+      const file = $("videoFile").files[0];
+      if (!file) return;
+
+      $("runBtn").disabled = true;
+      setStatus("running", "running", "Uploading and running analysis…");
+
+      $("jobLinks").innerHTML = "";
+      $("throwList").innerHTML = `<div class="muted">Running…</div>`;
+      $("scoreBox").innerHTML = `<div class="muted">Running…</div>`;
+      $("selectedInfo").textContent = "Running…";
+      $("player").removeAttribute("src");
+      $("player").load();
+      $("videoHint").textContent = "";
+
+      try {
+        const fd = new FormData();
+        // IMPORTANT: backend expects field name "video"
+        fd.append("video", file);
+
+        fd.append("enable_dtw", $("enableDTW").checked);
+        fd.append("enable_annotation", $("enableAnno").checked);
+
+        const resp = await fetch("/api/jobs", { method: "POST", body: fd });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || "Job failed");
+
+        currentJob = data;
+        $("jobLinks").innerHTML = buildLinks(data);
+
+        setStatus("done", "ok", "Completed. Loading manifest…");
+
+        await loadManifest(data.job_id);
+
+        setStatus("done", "ok", "Completed.");
+      } catch (err) {
+        setStatus("failed", "failed", "Failed: " + err);
+        $("throwList").innerHTML = `<div class="muted">Failed.</div>`;
+        $("scoreBox").innerHTML = `<div class="muted">Failed.</div>`;
+      } finally {
+        $("runBtn").disabled = false;
+      }
+    });
+    const playerEl = document.getElementById("player");
+    playerEl.addEventListener("error", () => {
+    const e = playerEl.error;
+    const code = e ? e.code : null;
+    const msgMap = {
+        1: "MEDIA_ERR_ABORTED (playback aborted)",
+        2: "MEDIA_ERR_NETWORK (network error)",
+        3: "MEDIA_ERR_DECODE (decode error / unsupported codec)",
+        4: "MEDIA_ERR_SRC_NOT_SUPPORTED (format not supported)",
+    };
+    const msg = code ? (msgMap[code] || ("Unknown media error code " + code)) : "Unknown media error";
+    document.getElementById("videoErr").textContent = "Video error: " + msg;
+    });
+    playerEl.addEventListener("loadedmetadata", () => {
+    document.getElementById("videoErr").textContent = "";
+    });
+
+    // init
+    resetUI();
+  </script>
 </body>
 </html>

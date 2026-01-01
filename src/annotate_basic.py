@@ -7,6 +7,9 @@ import re
 import cv2
 import numpy as np
 import pandas as pd
+import os
+import subprocess
+
 
 
 NAMED_CONNECTIONS = [
@@ -25,6 +28,70 @@ NAMED_CONNECTIONS = [
     ("right_knee","right_ankle"),
     ("right_ankle","right_foot_index"),
 ]
+
+print("[DEBUG] annotate_basic loaded from:", __file__)
+
+    
+def ensure_browser_mp4(mp4_path: Path, ffmpeg_bin: str = "ffmpeg") -> bool:
+    """
+    Normalize MP4 for browser playback:
+    - H.264 (libx264)
+    - yuv420p pixel format
+    - faststart (moov atom at beginning)
+    - no audio (-an) for maximum compatibility
+    """
+    mp4_path = Path(mp4_path)
+    if not mp4_path.exists():
+        print(f"[WARN] ensure_browser_mp4: file not found: {mp4_path}")
+        return False
+
+    tmp_path = mp4_path.with_suffix(".tmp.mp4")
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i", str(mp4_path),
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-an",
+        str(tmp_path),
+    ]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            print("[WARN] ensure_browser_mp4 failed:")
+            print("  file:", mp4_path)
+            print("  cmd :", " ".join(cmd))
+            err_lines = (completed.stderr or "").splitlines()
+            print("  ffmpeg stderr tail:\n", "\n".join(err_lines[-30:]))
+            if tmp_path.exists():
+                try: tmp_path.unlink()
+                except Exception: pass
+            return False
+
+        os.replace(str(tmp_path), str(mp4_path))
+        print(f"[INFO] ensure_browser_mp4 OK: {mp4_path}")
+        return True
+
+    except FileNotFoundError:
+        print(f"[WARN] ensure_browser_mp4: ffmpeg not found: {ffmpeg_bin}")
+        return False
+    except Exception as e:
+        print(f"[WARN] ensure_browser_mp4 unexpected error: {type(e).__name__}: {e}")
+        if tmp_path.exists():
+            try: tmp_path.unlink()
+            except Exception: pass
+        return False
 
 
 def _discover_keypoints_columns(df: pd.DataFrame):
@@ -255,6 +322,11 @@ def annotate_one_throw(
 ):
 
     out_path = throw_dir / "annotated.mp4"
+    print("[DEBUG] score_obj is None?", score_obj is None)
+    if score_obj is not None:
+        print("[DEBUG] score_obj keys:", list(score_obj.keys()))
+        print("[DEBUG] dtw feature keys:", list((score_obj.get("dtw", {}).get("features", {}) or {}).keys())[:20])
+
 
     cap = cv2.VideoCapture(str(clip_mp4))
     if not cap.isOpened():
@@ -442,6 +514,7 @@ def annotate_one_throw(
         # ===== DTW-driven bracket: feet_lr_dist =====
         if row is not None and score_obj is not None and named_pts:
             try:
+                print("[DEBUG] entering feet_lr_dist marker block")
                 feat = score_obj.get("dtw", {}).get("features", {}).get("feet_lr_dist", None)
                 # feat is expected to be a dict like: {"value":..., "level":...}
                 if isinstance(feat, dict) and feat.get("level", "ok") != "ok":
@@ -462,8 +535,9 @@ def annotate_one_throw(
                             else:
                                 color = (0, 255, 255)    # warn -> yellow (BGR)
                             draw_bracket_between_points(frame, pL, pR, offset=16, tick=10, thickness=2, color=color)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ANNOTATE][throw_{throw_id:03d}][frame={frame_idx_in_video}] feet_lr_dist failed:", repr(e))
+
 
         # ===== DTW-driven vertical ruler: shoulder_to_wrist_y_dist =====
         if row is not None and score_obj is not None and named_pts:
@@ -498,8 +572,9 @@ def annotate_one_throw(
                             rx = wrx
                             draw_vertical_ruler(frame, rx, shy, wry, tick=10, thickness=2, color=color)
 
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ANNOTATE][throw_{throw_id:03d}][frame={frame_idx_in_video}] shoulder_to_wrist_y_dist failed:", repr(e))
+
             
                 # ===== DTW-driven vertical ruler: shoulder_to_elbow_y_dist =====
         if row is not None and score_obj is not None and named_pts:
@@ -532,8 +607,8 @@ def annotate_one_throw(
                             rx = elx   # 绑定在肘的位置（和你 wrist 绑定风格一致）
                             draw_vertical_ruler(frame, rx, shy, ely, tick=10, thickness=2, color=color)
 
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ANNOTATE][throw_{throw_id:03d}][frame={frame_idx_in_video}] shoulder_to_elbow_y_dist failed:", repr(e))
       
         # ===== DTW-driven dashed line: wrist_to_samehip_dist =====
         if row is not None and score_obj is not None and named_pts:
@@ -566,8 +641,8 @@ def annotate_one_throw(
                             # dashed line (usually diagonal)
                             draw_dashed_line(frame, pW, pH, dash_len=10, gap_len=8, thickness=2, color=color)
 
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ANNOTATE][throw_{throw_id:03d}][frame={frame_idx_in_video}] wrist_to_samehip_dist failed:", repr(e))
         
                 # ===== DTW-driven dashed line: elbow_to_samehip_dist =====
         if row is not None and score_obj is not None and named_pts:
@@ -599,8 +674,8 @@ def annotate_one_throw(
 
                             draw_dashed_line(frame, pE, pH, dash_len=10, gap_len=8, thickness=2, color=color)
 
-            except Exception:
-                pass  
+            except Exception as e:
+                print(f"[ANNOTATE][throw_{throw_id:03d}][frame={frame_idx_in_video}] elbow_to_samehip_dist failed:", repr(e))
         
         # ===== DTW-driven angle markers: elbow/shoulder/hip =====
         if row is not None and score_obj is not None and named_pts:
@@ -653,9 +728,8 @@ def annotate_one_throw(
                     if sh and hp and kn:
                         draw_angle_marker(frame, hp, sh, kn, length=26, thickness=2, color=c)
 
-            except Exception:
-                pass
-
+            except Exception as e:
+                print(f"[ANNOTATE][throw_{throw_id:03d}][frame={frame_idx_in_video}] angles failed:", repr(e))
 
         # Draw ball + trail
         if row is not None and bx and by:
@@ -685,7 +759,12 @@ def annotate_one_throw(
 
     cap.release()
     writer.release()
+
+    # Normalize for browser playback (H.264 + yuv420p + faststart)
+    ensure_browser_mp4(out_path)
+
     return out_path
+
 
 
 def annotate_from_events(video_dir: Path):

@@ -514,7 +514,6 @@ def annotate_one_throw(
         # ===== DTW-driven bracket: feet_lr_dist =====
         if row is not None and score_obj is not None and named_pts:
             try:
-                print("[DEBUG] entering feet_lr_dist marker block")
                 feat = score_obj.get("dtw", {}).get("features", {}).get("feet_lr_dist", None)
                 # feat is expected to be a dict like: {"value":..., "level":...}
                 if isinstance(feat, dict) and feat.get("level", "ok") != "ok":

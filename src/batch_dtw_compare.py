@@ -100,6 +100,7 @@ class BatchDTWComparer:
         return info
 
     def compare_all(self) -> pd.DataFrame:
+        USE_POSE_ALIGN = True
         results = []
 
         print("\n" + "=" * 70)
@@ -120,7 +121,10 @@ class BatchDTWComparer:
                     str(clip["csv_path"]),
                     handedness="auto",
                     save_frame_csv=True,
+                    use_pose_align=USE_POSE_ALIGN,
+                    save_align_path=USE_POSE_ALIGN,
                 )
+
 
                 row = {
                     "video_name": clip["video_name"],

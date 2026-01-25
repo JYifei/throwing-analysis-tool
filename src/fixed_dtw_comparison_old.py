@@ -2,19 +2,13 @@
 """
 Fixed Motion Comparison - Proper Normalization + Teacher Feature Set
 
-Teacher-required pipeline (legacy mode):
+Teacher-required pipeline:
 Step 1) For each variable, compute DTW alignment and output ONE scalar per variable:
-        -> average of aligned (DTW-warped) per-frame distances.
+        -> average of aligned (DTW-warped) per-frame relative distances.
 Step 2) Overall matching score = average of all variable scalars.
 
-NEW (pose-align mode):
-- Use ONE multi-dimensional DTW alignment path computed from normalized pose vectors
-  (relative keypoint coordinates).
-- Then re-compute ALL per-feature frame distances along this ONE alignment path.
-- Keeps legacy mode unchanged by default.
-
-IMPORTANT:
-- Default behavior is unchanged: compare(..., use_pose_align=False) uses old per-feature DTW.
+Also supports left-handed students:
+- Distances/angles that are "right side" are computed on dominant side instead.
 """
 
 import numpy as np
@@ -29,15 +23,10 @@ warnings.filterwarnings("ignore")
 class FixedMotionDTW:
     """
     Properly normalized DTW comparison
-    - Legacy mode:
-        - Origin: hip center (sequence mean)
-        - Scale: body_height (shoulder-hip vertical distance)
-        - Facing: mirror x if needed (based on body_facing mode)
-        - DTW distance: relative difference (percentage-like, 0..1 capped)
-    - Pose-align mode (NEW):
-        - Build per-frame normalized pose vectors (translation/scale/rotation)
-        - Compute ONE DTW path using multi-dim pose vectors
-        - Recompute teacher features differences along that path
+    - Origin: hip center (sequence mean)
+    - Scale: body_height (shoulder-hip vertical distance)
+    - Facing: mirror x if needed (based on body_facing mode)
+    - DTW distance: relative difference (percentage-like, 0..1 capped)
     """
 
     # Teacher-required feature names (generic / side-agnostic)
@@ -50,29 +39,20 @@ class FixedMotionDTW:
         "wrist_to_opphip_dist",            # dominant wrist to opposite hip
         "elbow_to_samehip_dist",           # dominant elbow to dominant hip
         "elbow_to_opphip_dist",            # dominant elbow to opposite hip
-        "shoulder_to_wrist_y_dist",        # |y_shoulder - y_wrist|
-        "shoulder_to_elbow_y_dist",        # |y_shoulder - y_elbow|
+        "shoulder_to_wrist_y_dist",         # |y_shoulder - y_wrist|
+        "shoulder_to_elbow_y_dist",
+        # |y_shoulder - y_elbow|
     ]
 
-    # Angle features are compared in absolute degrees (raw).
+    # Angle features should be compared in absolute degrees (raw),
+    # but DTW alignment can use a normalized distance to stay scale-consistent.
     ANGLE_FEATURES = {"elbow_angle", "shoulder_angle", "hip_angle"}
     ANGLE_MAX_DEG = 180.0
 
-    # Pose-align: which joints to use (12 points => 24 dims x,y)
-    # Order matters: keep consistent for student and reference.
-    POSE_JOINTS = [
-        ("left",  "shoulder"), ("right", "shoulder"),
-        ("left",  "hip"),      ("right", "hip"),
-        ("left",  "elbow"),    ("right", "elbow"),
-        ("left",  "wrist"),    ("right", "wrist"),
-        ("left",  "knee"),     ("right", "knee"),
-        ("left",  "ankle"),    ("right", "ankle"),
-    ]
-
     def _angle_distance_norm(self, x, y) -> float:
         """
-        DTW distance for angles (legacy per-feature DTW):
-        normalized absolute degree difference in [0, 1].
+        DTW distance for angles: normalized absolute degree difference.
+        Return in [0, 1] by dividing by 180.
         """
         ref_val = float(x[0])
         stu_val = float(y[0])
@@ -99,6 +79,7 @@ class FixedMotionDTW:
             facing=self.reference_facing,
             dominant_side=self.reference_handedness,
         )
+
 
     # -----------------------------
     # Utilities
@@ -142,18 +123,6 @@ class FixedMotionDTW:
 
         return min(abs(ref_val - stu_val) / abs(ref_val), 1.0)
 
-    def _aligned_relative_scalar(self, ref_val: float, stu_val: float) -> float:
-        """
-        Same as _relative_distance but scalar inputs.
-        Returns in [0,1].
-        """
-        thr = 1e-3
-        if np.isnan(ref_val) or np.isnan(stu_val):
-            return np.nan
-        if abs(ref_val) < thr:
-            return min(abs(ref_val - stu_val), 1.0)
-        return min(abs(ref_val - stu_val) / abs(ref_val), 1.0)
-
     def _interpolate_sequence(self, seq: np.ndarray) -> np.ndarray:
         """Linear interpolate NaN; ffill/bfill at ends."""
         if seq.size == 0:
@@ -165,42 +134,30 @@ class FixedMotionDTW:
         s = s.ffill().bfill()
         return s.values
 
-    def _interpolate_matrix(self, mat: np.ndarray) -> np.ndarray:
-        """
-        Interpolate NaNs in a 2D matrix column-wise.
-        mat: (T, D)
-        """
-        if mat.size == 0:
-            return mat
-        out = mat.copy()
-        for j in range(out.shape[1]):
-            out[:, j] = self._interpolate_sequence(out[:, j])
-        return out
-
     # -----------------------------
-    # Normalization (legacy)
+    # Normalization
     # -----------------------------
     def _normalize_coordinates(self, df: pd.DataFrame, facing: str) -> pd.DataFrame:
         """
-        Legacy normalization:
-        1) body_height = |mean(shoulder_y) - mean(hip_y)|
-        2) origin = hip center mean (sequence mean)
-        3) normalize all *_x/*_y by subtracting origin and dividing by body_height
-        4) mirror x if facing != reference_facing
+        1) Compute body_height = |mean(shoulder_y) - mean(hip_y)|
+        2) Compute hip center (mean) as origin
+        3) Normalize all *_x/*_y by subtracting origin and dividing by body_height
+        4) Mirror x if facing != reference_facing
         """
         df = df.copy()
 
+        # shoulder_y candidates
         shoulder_y = self._pick_series(df, ["right_shoulder_y", "shoulder_y", "left_shoulder_y"])
+        # hip_y candidates
         hip_y = self._pick_series(df, ["hip_y", "right_hip_y", "left_hip_y"])
 
         if shoulder_y is None or hip_y is None:
+            # last resort: use any *_y columns mean span
             y_cols = [c for c in df.columns if c.endswith("_y")]
             if len(y_cols) == 0:
                 body_height = 100.0
             else:
-                body_height = float(
-                    abs(df[y_cols].mean(numeric_only=True).max() - df[y_cols].mean(numeric_only=True).min())
-                )
+                body_height = float(abs(df[y_cols].mean(numeric_only=True).max() - df[y_cols].mean(numeric_only=True).min()))
         else:
             body_height = float(abs(hip_y.mean() - shoulder_y.mean()))
 
@@ -216,6 +173,7 @@ class FixedMotionDTW:
                 hip_center_x = df["right_hip_x"]
                 hip_center_y = df["right_hip_y"]
         else:
+            # If hip is missing, fall back to mean of all coords (not ideal but prevents crash)
             x_cols = [c for c in df.columns if c.endswith("_x")]
             y_cols = [c for c in df.columns if c.endswith("_y")]
             hip_center_x = df[x_cols].mean(axis=1) if x_cols else pd.Series(np.zeros(len(df)))
@@ -264,7 +222,9 @@ class FixedMotionDTW:
         side = side.lower()
         assert side in ("left", "right")
 
+        # Common naming variants
         if joint == "wrist":
+            # in your current code, wrist may be stored as hand_x/hand_y
             x_cands = [f"{side}_wrist_x", f"{side}_hand_x", "hand_x"]
             y_cands = [f"{side}_wrist_y", f"{side}_hand_y", "hand_y"]
         elif joint == "elbow":
@@ -294,135 +254,6 @@ class FixedMotionDTW:
         return x, y
 
     # -----------------------------
-    # Pose-align helpers (NEW)
-    # -----------------------------
-    def _get_pose_points_row(self, row: pd.Series) -> np.ndarray:
-        """
-        Build 12x2 points for one frame using raw coordinates.
-        Returns array shape (12,2) with NaNs if missing.
-        """
-        pts = []
-        for side, joint in self.POSE_JOINTS:
-            x, y = self._get_point(row, side, joint)
-            pts.append([x, y])
-        return np.array(pts, dtype=float)
-
-    def _normalize_pose_frame(self, pts: np.ndarray, flip_x: bool = False) -> np.ndarray:
-        """
-        Normalize a single frame pose:
-        - translation: origin at mid-hip
-        - scale: shoulder width
-        - optional mirror: flip x in local coords
-        - rotation: align shoulder vector to x-axis
-
-        pts: (12,2) raw coords
-        returns: (12,2) normalized coords (NaN-safe)
-        """
-        pts_n = pts.copy()
-
-        # indices for shoulders and hips based on POSE_JOINTS order
-        # [L_sh, R_sh, L_hip, R_hip, ...]
-        LSH, RSH = 0, 1
-        LHIP, RHIP = 2, 3
-
-        lhip = pts_n[LHIP]
-        rhip = pts_n[RHIP]
-        lsh = pts_n[LSH]
-        rsh = pts_n[RSH]
-
-        if np.any(np.isnan(lhip)) or np.any(np.isnan(rhip)) or np.any(np.isnan(lsh)) or np.any(np.isnan(rsh)):
-            return np.full_like(pts_n, np.nan)
-
-        mid_hip = (lhip + rhip) / 2.0
-        pts_n = pts_n - mid_hip  # translation
-
-        if flip_x:
-            pts_n[:, 0] = -pts_n[:, 0]  # mirror in local coords
-
-        shoulder_vec = (rsh - lsh)
-        sw = float(np.linalg.norm(shoulder_vec))
-        if sw < 1e-6 or np.isnan(sw):
-            sw = 1.0
-
-        pts_n = pts_n / sw  # scale
-
-        # rotation: align shoulder vector to x-axis
-        # after translation/flip/scale, recompute shoulder vector in normalized space
-        lsh2 = pts_n[LSH]
-        rsh2 = pts_n[RSH]
-        v = rsh2 - lsh2
-        if np.any(np.isnan(v)) or float(np.linalg.norm(v)) < 1e-6:
-            return pts_n
-
-        theta = float(np.arctan2(v[1], v[0]))
-        c, s = float(np.cos(-theta)), float(np.sin(-theta))
-        R = np.array([[c, -s], [s, c]], dtype=float)
-
-        pts_rot = (R @ pts_n.T).T
-        return pts_rot
-
-    def _build_pose_matrix(self, df: pd.DataFrame, flip_x: bool = False) -> np.ndarray:
-        """
-        Build normalized pose matrix for a whole clip:
-        returns shape (T, D) where D=24 (12 points x 2).
-        """
-        mats = []
-        for _, row in df.iterrows():
-            pts = self._get_pose_points_row(row)
-            pts_n = self._normalize_pose_frame(pts, flip_x=flip_x)
-            mats.append(pts_n.reshape(-1))  # flatten to (24,)
-        mat = np.vstack(mats) if mats else np.zeros((0, 24), dtype=float)
-        mat = self._interpolate_matrix(mat)
-        return mat
-
-    def _pose_dist_l2(self, a: np.ndarray, b: np.ndarray) -> float:
-        """Distance between two pose vectors (D,)."""
-        if a is None or b is None:
-            return float("nan")
-        # NaN guard: if any NaN remains, treat as large distance
-        if np.any(np.isnan(a)) or np.any(np.isnan(b)):
-            return 1e6
-        return float(np.linalg.norm(a - b))
-
-    def _compute_pose_dtw_path(self, ref_pose: np.ndarray, stu_pose: np.ndarray) -> Tuple[float, List[Tuple[int, int]]]:
-        """
-        Compute DTW path using multi-dimensional pose vectors.
-        Returns (dtw_norm, path) where path is list of (ref_idx, stu_idx).
-        """
-        if ref_pose.shape[0] < 3 or stu_pose.shape[0] < 3:
-            return np.nan, []
-
-        dist, path = fastdtw(ref_pose, stu_pose, dist=self._pose_dist_l2)
-        dtw_norm = float(dist) / max(len(path), 1)
-        return dtw_norm, path
-
-    def _path_to_map_s_to_m(self, path: List[Tuple[int, int]], n_student: int) -> np.ndarray:
-        """
-        Convert DTW path (ref_idx, stu_idx) to a stable mapping map_s_to_m[s]=m
-        using median of matched reference indices.
-        """
-        if n_student <= 0:
-            return np.zeros((0,), dtype=int)
-
-        stu_to_ref: Dict[int, List[int]] = {}
-        for ref_idx, stu_idx in path:
-            if 0 <= stu_idx < n_student:
-                stu_to_ref.setdefault(stu_idx, []).append(ref_idx)
-
-        map_s_to_m = np.full(n_student, -1, dtype=int)
-        last_valid = 0
-        for s in range(n_student):
-            refs = stu_to_ref.get(s, [])
-            if refs:
-                m = int(np.median(refs))
-                map_s_to_m[s] = m
-                last_valid = m
-            else:
-                map_s_to_m[s] = last_valid  # carry forward
-
-        return map_s_to_m
-
-    # -----------------------------
     # Handedness
     # -----------------------------
     def _infer_handedness(self, df_norm: pd.DataFrame) -> str:
@@ -431,18 +262,9 @@ class FixedMotionDTW:
         choose side whose wrist has larger motion magnitude (std of distance to hip).
         If left/right wrist columns are unavailable, fall back to 'right'.
         """
-        has_lw = (
-            self._has_series(df_norm, "left_wrist_x")
-            or self._has_series(df_norm, "left_hand_x")
-            or self._has_series(df_norm, "left_wrist_y")
-            or self._has_series(df_norm, "left_hand_y")
-        )
-        has_rw = (
-            self._has_series(df_norm, "right_wrist_x")
-            or self._has_series(df_norm, "right_hand_x")
-            or self._has_series(df_norm, "right_wrist_y")
-            or self._has_series(df_norm, "right_hand_y")
-        )
+        # need both wrists to infer
+        has_lw = self._has_series(df_norm, "left_wrist_x") or self._has_series(df_norm, "left_hand_x") or self._has_series(df_norm, "left_wrist_y") or self._has_series(df_norm, "left_hand_y")
+        has_rw = self._has_series(df_norm, "right_wrist_x") or self._has_series(df_norm, "right_hand_x") or self._has_series(df_norm, "right_wrist_y") or self._has_series(df_norm, "right_hand_y")
 
         has_lhip = self._has_series(df_norm, "left_hip_x") and self._has_series(df_norm, "left_hip_y")
         has_rhip = self._has_series(df_norm, "right_hip_x") and self._has_series(df_norm, "right_hip_y")
@@ -450,6 +272,7 @@ class FixedMotionDTW:
         if not (has_lw and has_rw and has_lhip and has_rhip):
             return "right"
 
+        # build distances
         lwx = self._pick_series(df_norm, ["left_wrist_x", "left_hand_x"])
         lwy = self._pick_series(df_norm, ["left_wrist_y", "left_hand_y"])
         rwx = self._pick_series(df_norm, ["right_wrist_x", "right_hand_x"])
@@ -467,11 +290,11 @@ class FixedMotionDTW:
         return "left" if lstd > rstd else "right"
 
     # -----------------------------
-    # Feature extraction (teacher set) - legacy normalized coords
+    # Feature extraction (teacher set)
     # -----------------------------
     def _extract_features(self, df: pd.DataFrame, facing: str, dominant_side: str) -> Dict[str, np.ndarray]:
         """
-        Extract teacher-required sequences (legacy normalized coordinates).
+        Extract teacher-required sequences (all already normalized).
 
         dominant_side: 'left' or 'right'
         """
@@ -483,6 +306,7 @@ class FixedMotionDTW:
 
         feats: Dict[str, np.ndarray] = {}
 
+        # 1) elbow_angle (shoulder - elbow - wrist) on dominant side
         elbow_angles = []
         shoulder_angles = []
         hip_angles = []
@@ -496,21 +320,25 @@ class FixedMotionDTW:
             hp = self._get_point(row, dom, "hip")
             kn = self._get_point(row, dom, "knee")
 
+            # elbow angle
             if not (np.isnan(sh[0]) or np.isnan(el[0]) or np.isnan(wr[0])):
                 elbow_angles.append(self._calculate_angle(sh, el, wr))
             else:
                 elbow_angles.append(np.nan)
 
+            # shoulder angle (elbow - shoulder - hip)
             if not (np.isnan(el[0]) or np.isnan(sh[0]) or np.isnan(hp[0])):
                 shoulder_angles.append(self._calculate_angle(el, sh, hp))
             else:
                 shoulder_angles.append(np.nan)
 
+            # hip angle (shoulder - hip - knee)
             if not (np.isnan(sh[0]) or np.isnan(hp[0]) or np.isnan(kn[0])):
                 hip_angles.append(self._calculate_angle(sh, hp, kn))
             else:
                 hip_angles.append(np.nan)
 
+            # vertical-only distances
             if not (np.isnan(sh[1]) or np.isnan(wr[1])):
                 shoulder_wrist_y.append(abs(sh[1] - wr[1]))
             else:
@@ -525,7 +353,8 @@ class FixedMotionDTW:
         feats["shoulder_angle"] = np.array(shoulder_angles, dtype=float)
         feats["hip_angle"] = np.array(hip_angles, dtype=float)
 
-        # feet distance
+        # 2) distance between left & right feet (normalized)
+        # Use ankles/feet if available
         feet_dist = []
         for _, row in df_norm.iterrows():
             lf = self._get_point(row, "left", "ankle")
@@ -536,6 +365,7 @@ class FixedMotionDTW:
                 feet_dist.append(np.nan)
         feats["feet_lr_dist"] = np.array(feet_dist, dtype=float)
 
+        # 3) wrist/elbow distances to hips (dominant vs opposite)
         def dist_points(a: Tuple[float, float], b: Tuple[float, float]) -> float:
             if np.isnan(a[0]) or np.isnan(b[0]):
                 return np.nan
@@ -565,6 +395,7 @@ class FixedMotionDTW:
         feats["shoulder_to_wrist_y_dist"] = np.array(shoulder_wrist_y, dtype=float)
         feats["shoulder_to_elbow_y_dist"] = np.array(shoulder_elbow_y, dtype=float)
 
+        # Ensure all required keys exist (even if NaN)
         for k in self.FEATURE_NAMES:
             if k not in feats:
                 feats[k] = np.full(n, np.nan, dtype=float)
@@ -572,7 +403,7 @@ class FixedMotionDTW:
         return feats
 
     # -----------------------------
-    # DTW + per-feature legacy alignment
+    # DTW + "average across frames"
     # -----------------------------
     def _compute_frame_distances_from_path(
         self,
@@ -619,11 +450,12 @@ class FixedMotionDTW:
         frame_use_relative: bool = True,
     ) -> Tuple[float, list, np.ndarray]:
         """
-        Legacy per-feature DTW:
         Returns:
             dtw_norm: distance/len(path) (kept for debugging)
             path: DTW path
             frame_dists: aligned per-student-frame distances
+                - relative (0..1) if frame_use_relative=True
+                - absolute (raw) if frame_use_relative=False
         """
         if dist_fn is None:
             dist_fn = self._relative_distance
@@ -648,28 +480,21 @@ class FixedMotionDTW:
         )
         return dtw_norm, path, frame_dists
 
-    # -----------------------------
-    # Compare
-    # -----------------------------
+
     def compare(
         self,
         student_csv: str,
         handedness: str = "auto",
         save_frame_csv: bool = False,
-        use_pose_align: bool = False,
-        save_align_path: bool = True,
     ) -> Tuple[Dict[str, float], Dict[str, np.ndarray], Dict[str, str]]:
         """
-        Outputs:
-        - per_feature_score: ONE scalar per variable + overall_matching_score
-        - frame_distances_dict: per-frame distances for each feature (length = n_student_frames)
-        - meta: used handedness & facing + align method
+        Teacher-required outputs:
+        - per_feature_score: ONE scalar per variable = mean(aligned frame distances)
+        - frame_distances_dict: (optional) for debugging/visualization
+        - meta: used handedness & facing
 
         handedness:
-            'right' / 'left' / 'auto'
-        use_pose_align:
-            False => legacy per-feature DTW (default, unchanged)
-            True  => NEW: pose-vector DTW path + aligned per-feature errors along that path
+            'right' / 'left' / 'auto' (auto tries to infer from motion)
         """
         student_df = pd.read_csv(student_csv)
         student_facing = self._safe_mode(student_df, "body_facing", default="unknown")
@@ -689,101 +514,33 @@ class FixedMotionDTW:
                 dom = self._infer_handedness(df_norm_for_infer)
                 handedness_source = "heuristic"
 
-        # Compute teacher features (legacy normalized coords)
+
         student_features = self._extract_features(student_df, facing=student_facing, dominant_side=dom)
 
         per_feature_score: Dict[str, float] = {}
         frame_distances_dict: Dict[str, np.ndarray] = {}
-
-        # -----------------------------
-        # Branch A: Legacy per-feature DTW (UNCHANGED)
-        # -----------------------------
-        if not use_pose_align:
-            for feat in self.FEATURE_NAMES:
-                ref_seq = self.reference_features.get(feat, np.full(len(self.reference_df), np.nan))
-                stu_seq = student_features.get(feat, np.full(len(student_df), np.nan))
-
-                if feat in self.ANGLE_FEATURES:
-                    _, _, frame_dists_deg = self._compute_dtw(
-                        ref_seq, stu_seq, dist_fn=self._angle_distance_norm, frame_use_relative=False
-                    )
-                    frame_distances_dict[feat] = frame_dists_deg
-                    per_feature_score[feat] = float(np.nanmean(frame_dists_deg)) if np.any(~np.isnan(frame_dists_deg)) else np.nan
-                else:
-                    _, _, frame_dists = self._compute_dtw(ref_seq, stu_seq)
-                    frame_distances_dict[feat] = frame_dists
-                    per_feature_score[feat] = float(np.nanmean(frame_dists)) if np.any(~np.isnan(frame_dists)) else np.nan
-
-            # overall
-            vals_norm = []
-            for feat in self.FEATURE_NAMES:
-                v = per_feature_score.get(feat, np.nan)
-                if np.isnan(v):
-                    continue
-                if feat in self.ANGLE_FEATURES:
-                    vals_norm.append(min(v / self.ANGLE_MAX_DEG, 1.0))
-                else:
-                    vals_norm.append(v)
-            per_feature_score["overall_matching_score"] = float(np.mean(vals_norm)) if vals_norm else np.nan
-
-            if save_frame_csv:
-                self._save_frame_distances_csv(student_csv, frame_distances_dict, len(student_df))
-                self._save_summary_csv(student_csv, per_feature_score)
-
-            meta = {
-                "align_method": "legacy_per_feature_dtw",
-                "student_facing": str(student_facing),
-                "reference_facing": str(self.reference_facing),
-                "dominant_side": str(dom),
-                "handedness_source": str(handedness_source),
-            }
-            return per_feature_score, frame_distances_dict, meta
-
-        # -----------------------------
-        # Branch B: NEW Pose-Align DTW path + aligned per-feature differences
-        # -----------------------------
-        # Flip reference pose in local coords if dominant side differs (left vs right throw)
-        flip_ref_pose = (dom != self.reference_handedness)
-
-        ref_pose = self._build_pose_matrix(self.reference_df, flip_x=flip_ref_pose)
-        stu_pose = self._build_pose_matrix(student_df, flip_x=False)
-
-        pose_dtw_norm, pose_path = self._compute_pose_dtw_path(ref_pose, stu_pose)
-        map_s_to_m = self._path_to_map_s_to_m(pose_path, n_student=len(student_df))
-
-        # Save align path (optional)
-        if save_frame_csv and save_align_path:
-            self._save_pose_align_path_csv(student_csv, pose_path)
-            self._save_pose_align_map_csv(student_csv, map_s_to_m)
-
-        # Recompute per-frame distances for each teacher feature along map_s_to_m
-        n_stu = len(student_df)
         for feat in self.FEATURE_NAMES:
             ref_seq = self.reference_features.get(feat, np.full(len(self.reference_df), np.nan))
-            stu_seq = student_features.get(feat, np.full(n_stu, np.nan))
+            stu_seq = student_features.get(feat, np.full(len(student_df), np.nan))
 
-            ref_seq_i = self._interpolate_sequence(np.array(ref_seq, dtype=float))
-            stu_seq_i = self._interpolate_sequence(np.array(stu_seq, dtype=float))
+            if feat in self.ANGLE_FEATURES:
+                # DTW alignment uses normalized distance, but output distances are raw degrees
+                _, _, frame_dists_deg = self._compute_dtw(
+                    ref_seq, stu_seq, dist_fn=self._angle_distance_norm, frame_use_relative=False
+                )
+                frame_distances_dict[feat] = frame_dists_deg
 
-            aligned = np.full(n_stu, np.nan, dtype=float)
-            for s in range(n_stu):
-                m = int(map_s_to_m[s])
-                if m < 0 or m >= len(ref_seq_i):
-                    continue
-                rv = float(ref_seq_i[m])
-                sv = float(stu_seq_i[s])
-                if np.isnan(rv) or np.isnan(sv):
-                    continue
+                # Teacher Step 1 (angle): raw degree difference scalar
+                per_feature_score[feat] = float(np.nanmean(frame_dists_deg)) if np.any(~np.isnan(frame_dists_deg)) else np.nan
+            else:
+                # Non-angle: keep your original relative-distance pipeline
+                _, _, frame_dists = self._compute_dtw(ref_seq, stu_seq)
+                frame_distances_dict[feat] = frame_dists
 
-                if feat in self.ANGLE_FEATURES:
-                    aligned[s] = abs(rv - sv)  # degrees
-                else:
-                    aligned[s] = self._aligned_relative_scalar(rv, sv)  # 0..1
+                per_feature_score[feat] = float(np.nanmean(frame_dists)) if np.any(~np.isnan(frame_dists)) else np.nan
 
-            frame_distances_dict[feat] = aligned
-            per_feature_score[feat] = float(np.nanmean(aligned)) if np.any(~np.isnan(aligned)) else np.nan
-
-        # Overall score (same rule): angles normalized by 180 only for overall.
+        # Teacher Step 2: overall matching score = average across variables
+        # Angles are normalized by 180 for the overall only.
         vals_norm = []
         for feat in self.FEATURE_NAMES:
             v = per_feature_score.get(feat, np.nan)
@@ -793,31 +550,26 @@ class FixedMotionDTW:
                 vals_norm.append(min(v / self.ANGLE_MAX_DEG, 1.0))
             else:
                 vals_norm.append(v)
+
         per_feature_score["overall_matching_score"] = float(np.mean(vals_norm)) if vals_norm else np.nan
 
-        # Save aligned per-frame distances CSV for debugging + future pause-point selection
+        # Optional: save per-frame distances CSV (debug)
         if save_frame_csv:
-            self._save_pose_aligned_frame_csv(student_csv, frame_distances_dict, n_frames=n_stu)
-            self._save_summary_csv(student_csv.replace(".csv", "_pose_aligned.csv"), per_feature_score)
+            self._save_frame_distances_csv(student_csv, frame_distances_dict, len(student_df))
+            self._save_summary_csv(student_csv, per_feature_score)
+
 
         meta = {
-            "align_method": "pose_vector_dtw",
-            "pose_dtw_norm": str(pose_dtw_norm),
             "student_facing": str(student_facing),
             "reference_facing": str(self.reference_facing),
             "dominant_side": str(dom),
             "handedness_source": str(handedness_source),
-            "reference_handedness": str(self.reference_handedness),
-            "flip_reference_pose": str(flip_ref_pose),
         }
         return per_feature_score, frame_distances_dict, meta
 
-    # -----------------------------
-    # CSV saving
-    # -----------------------------
     def _save_frame_distances_csv(self, student_csv: str, frame_distances_dict: Dict[str, np.ndarray], n_frames: int):
         """
-        Legacy: Save per-frame aligned distances for debugging.
+        Save per-frame aligned distances for debugging.
         """
         data = {"frame": range(n_frames)}
         for feat in self.FEATURE_NAMES:
@@ -826,32 +578,7 @@ class FixedMotionDTW:
         df = pd.DataFrame(data)
         out = student_csv.replace(".csv", "_dtw_frame.csv")
         df.to_csv(out, index=False, float_format="%.4f")
-
-    def _save_pose_aligned_frame_csv(self, student_csv: str, frame_distances_dict: Dict[str, np.ndarray], n_frames: int):
-        """
-        Pose-align: Save per-frame aligned distances along ONE pose DTW mapping.
-        """
-        data = {"frame": range(n_frames)}
-        for feat in self.FEATURE_NAMES:
-            data[feat] = frame_distances_dict.get(feat, np.full(n_frames, np.nan))
-        df = pd.DataFrame(data)
-        out = student_csv.replace(".csv", "_pose_aligned_frame.csv")
-        df.to_csv(out, index=False, float_format="%.4f")
-
-    def _save_pose_align_path_csv(self, student_csv: str, path: List[Tuple[int, int]]):
-        """Save raw DTW path pairs (ref_idx, stu_idx)."""
-        if not path:
-            return
-        df = pd.DataFrame(path, columns=["ref_idx", "stu_idx"])
-        out = student_csv.replace(".csv", "_pose_align_path.csv")
-        df.to_csv(out, index=False)
-
-    def _save_pose_align_map_csv(self, student_csv: str, map_s_to_m: np.ndarray):
-        """Save stable mapping map_s_to_m[s]=ref_idx."""
-        df = pd.DataFrame({"stu_idx": np.arange(len(map_s_to_m)), "ref_idx": map_s_to_m.astype(int)})
-        out = student_csv.replace(".csv", "_pose_align_map.csv")
-        df.to_csv(out, index=False)
-
+        
     def _save_summary_csv(self, student_csv: str, per_feature_score: Dict[str, float]):
         """
         Save per-variable average scores + overall score to a separate CSV.
@@ -862,28 +589,19 @@ class FixedMotionDTW:
         rows.append({"variable": "overall_matching_score", "avg_dtw": per_feature_score.get("overall_matching_score", np.nan)})
 
         df = pd.DataFrame(rows)
-        # If caller passes a modified student_csv, keep consistent naming
-        if student_csv.endswith(".csv"):
-            out = student_csv.replace(".csv", "_dtw_summary.csv")
-        else:
-            out = student_csv + "_dtw_summary.csv"
+        out = student_csv.replace(".csv", "_dtw_summary.csv")
         df.to_csv(out, index=False, float_format="%.6f")
 
+
     # Convenience printer
-    def print_results(self, student_csv: str, handedness: str = "auto", use_pose_align: bool = False):
-        scores, _, meta = self.compare(
-            student_csv,
-            handedness=handedness,
-            save_frame_csv=False,
-            use_pose_align=use_pose_align,
-        )
+    def print_results(self, student_csv: str, handedness: str = "auto"):
+        scores, _, meta = self.compare(student_csv, handedness=handedness, save_frame_csv=False)
         print("\n" + "=" * 70)
         print("DTW Teacher Feature Set (1 scalar per variable + overall)")
         print("=" * 70)
-        print(f"Align method:     {meta.get('align_method', 'unknown')}")
-        print(f"Reference facing: {meta.get('reference_facing')}")
-        print(f"Student facing:   {meta.get('student_facing')}")
-        print(f"Dominant side:    {meta.get('dominant_side')} ({meta.get('handedness_source')})")
+        print(f"Reference facing: {meta['reference_facing']}")
+        print(f"Student facing:   {meta['student_facing']}")
+        print(f"Dominant side:    {meta['dominant_side']} ({meta['handedness_source']})")
         print("-" * 70)
         for k in self.FEATURE_NAMES:
             v = scores.get(k, np.nan)
@@ -903,6 +621,8 @@ class FixedMotionDTW:
         print("=" * 70)
 
 
+
+
 if __name__ == "__main__":
 
     # Example usage (project-root relative)
@@ -910,9 +630,5 @@ if __name__ == "__main__":
     stu_csv = "output/Eddie Throwing iPad recording 1/throws/throw_001/clip.csv"
 
     comparator = FixedMotionDTW(ref_csv, reference_handedness="auto")
+    comparator.print_results(stu_csv, handedness="auto")
 
-    # Legacy (unchanged)
-    comparator.print_results(stu_csv, handedness="auto", use_pose_align=False)
-
-    # NEW pose-align mode
-    comparator.print_results(stu_csv, handedness="auto", use_pose_align=True)

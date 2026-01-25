@@ -63,6 +63,26 @@
 
     .score-summary { padding:10px 12px; border:1px solid var(--border); border-radius:10px; background:#f9fafb; }
 
+    /* Advanced (details/summary) arrow toggle */
+    #advancedBox > summary {
+      list-style: none;           /* remove default marker */
+      cursor: pointer;
+      user-select: none;
+    }
+
+    #advancedBox > summary::-webkit-details-marker {
+      display: none;              /* Chrome / Safari */
+    }
+
+    #advancedBox > summary::before {
+      content: "▸ ";
+      font-size: 14px;
+    }
+
+    #advancedBox[open] > summary::before {
+      content: "▾ ";
+    }
+
   </style>
 </head>
 
@@ -93,6 +113,59 @@
           </label>
         </div>
 
+        <!-- 🔽 Advanced (collapsible with arrow toggle) -->
+        <details id="advancedBox" style="margin-bottom:12px;">
+          <summary class="muted" style="padding:6px 2px;">
+            Advanced: Explain Parameters
+          </summary>
+
+          <div class="card" style="margin-top:10px; padding:10px;">
+            <div class="muted" style="margin-bottom:8px;">
+              Explain Parameters (control when and how long the video pauses in Explain mode)
+            </div>
+
+            <div class="row" style="gap:12px; align-items:flex-end;">
+              <div style="display:flex; flex-direction:column; gap:6px;">
+                <label class="muted" for="sbsThreshold">Error Threshold (0–1)</label>
+                <input
+                  id="sbsThreshold"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                  value="0.35"
+                />
+              </div>
+
+              <div style="display:flex; flex-direction:column; gap:6px;">
+                <label class="muted" for="sbsPauseSeconds">Pause Duration (seconds)</label>
+                <input
+                  id="sbsPauseSeconds"
+                  type="number"
+                  min="0"
+                  max="5"
+                  step="0.1"
+                  value="0.8"
+                />
+              </div>
+
+              <div style="display:flex; flex-direction:column; gap:6px;">
+                <label class="muted" for="sbsMinGap">Minimum Gap (frames)</label>
+                <input
+                  id="sbsMinGap"
+                  type="number"
+                  min="0"
+                  max="200"
+                  step="1"
+                  value="12"
+                />
+              </div>
+            </div>
+          </div>
+        </details>
+        <!-- 🔼 End Advanced -->
+
+
         <div class="row">
           <button id="runBtn" class="btn" type="submit">Run Analysis</button>
           <button id="resetBtn" class="btn secondary" type="button">Reset</button>
@@ -101,6 +174,7 @@
 
         <div class="muted" id="statusText" style="margin-top:10px;">Ready.</div>
       </form>
+
 
       <div class="links" id="jobLinks" style="margin-top:12px;"></div>
 
@@ -122,6 +196,8 @@
             <div class="toggle" title="Preview mode">
               <button id="modeAnnotated" type="button" class="active">Annotated</button>
               <button id="modeClip" type="button">Clip</button>
+              <button id="modeCompare" type="button">Comparison</button>
+              <button id="modeExplain" type="button">Explain</button>
             </div>
             <div id="selectedInfo" class="muted">No throw selected.</div>
           </div>
@@ -147,7 +223,7 @@
     let currentJob = null;      // {job_id, status, result, job_url, download_url}
     let manifest = null;        // manifest.json object
     let selectedThrow = null;   // one entry from manifest.throws
-    let previewMode = "annotated"; // "annotated" | "clip" (default annotated)
+    let previewMode = "annotated"; // "annotated" | "clip" | "compare" | "explain"
 
     function setStatus(label, pillClass=null, detail=null) {
       const pill = $("statusPill");
@@ -304,7 +380,8 @@
       previewMode = mode;
       $("modeAnnotated").classList.toggle("active", mode === "annotated");
       $("modeClip").classList.toggle("active", mode === "clip");
-      // refresh current selection
+      $("modeCompare").classList.toggle("active", mode === "compare");
+      $("modeExplain").classList.toggle("active", mode === "explain");
       if (selectedThrow) updateVideoSource(selectedThrow);
     }
 
@@ -315,12 +392,47 @@
     }
 
     async function updateVideoSource(t) {
+      $("videoErr").textContent = "";
       const player = $("player");
       const hint = $("videoHint");
 
       // Choose URL based on preview mode.
       // - In manifest v1, t.video points to clip.mp4. We'll derive annotated path.
       // - We add a cache-busting query to avoid 304 issues in <video>.
+        // New: if manifest contains side-by-side outputs, prefer them for compare/explain modes
+      const sbsUrl = t.side_by_side_video || null;
+      const sbsPausedUrl = t.side_by_side_paused_video || null;
+
+      if (previewMode === "compare") {
+        if (!sbsUrl) {
+          $("videoHint").textContent = "Comparison video not found in manifest. (side_by_side_video missing)";
+          // fall back to annotated
+          previewMode = "annotated";
+        } else {
+          // play comparison
+          const bust = `v=${Date.now()}`;
+          const url = sbsUrl + (sbsUrl.includes("?") ? "&" : "?") + bust;
+          $("player").src = url;
+          $("player").load();
+          $("videoHint").textContent = "Previewing DTW-synced comparison (side_by_side.mp4).";
+          return;
+        }
+      }
+
+      if (previewMode === "explain") {
+        if (!sbsPausedUrl) {
+          $("videoHint").textContent = "Explain video not found in manifest. (side_by_side_paused_video missing)";
+          previewMode = "annotated";
+        } else {
+          const bust = `v=${Date.now()}`;
+          const url = sbsPausedUrl + (sbsPausedUrl.includes("?") ? "&" : "?") + bust;
+          $("player").src = url;
+          $("player").load();
+          $("videoHint").textContent = "Previewing DTW-synced explain version (paused).";
+          return;
+        }
+      }
+
       let clipUrl = t.video;
       let annotatedUrl = deriveAnnotatedUrlFromClipUrl(clipUrl);
 
@@ -424,6 +536,9 @@
 
     $("modeAnnotated").onclick = () => setPreviewMode("annotated");
     $("modeClip").onclick = () => setPreviewMode("clip");
+    $("modeCompare").onclick = () => setPreviewMode("compare");
+    $("modeExplain").onclick = () => setPreviewMode("explain");
+
 
     $("resetBtn").onclick = () => resetUI();
 
@@ -451,6 +566,10 @@
 
         fd.append("enable_dtw", $("enableDTW").checked);
         fd.append("enable_annotation", $("enableAnno").checked);
+        fd.append("sbs_threshold", $("sbsThreshold").value);
+        fd.append("sbs_pause_seconds", $("sbsPauseSeconds").value);
+        fd.append("sbs_min_gap", $("sbsMinGap").value);
+
 
         const resp = await fetch("/api/jobs", { method: "POST", body: fd });
         const data = await resp.json();

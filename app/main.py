@@ -14,10 +14,15 @@ from fastapi.responses import HTMLResponse
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from src.fsm_new import ensure_browser_mp4
+
 
 # Import your backend entrypoint
 # Make sure your project root is on PYTHONPATH when running uvicorn.
 from src.fsm_new import run_once
+from src.render_side_by_side import render_side_by_side, update_manifest
+
+DEFAULT_MODEL_CLIP = Path(os.environ.get("THROWING_MODEL_CLIP", "reference/model_clip.mp4")).resolve()
 
 
 APP_TITLE = "Throwing Analysis Tool"
@@ -76,22 +81,15 @@ def health():
 @app.post("/api/jobs")
 def create_job(
     video: UploadFile = File(...),
-    # optional toggles; keep minimal
     enable_annotation: bool = Form(True),
     enable_dtw: bool = Form(True),
-    # optional override paths (advanced users only; can hide in UI later)
     reference_csv: str = Form(str(DEFAULT_REFERENCE_CSV)),
     thresholds_json: str = Form(str(DEFAULT_THRESHOLDS_JSON)),
+    sbs_threshold: float = Form(0.35),
+    sbs_pause_seconds: float = Form(0.8),
+    sbs_min_gap: int = Form(12),
 ):
-    """
-    Minimal synchronous job runner:
-    - upload video
-    - run run_once()
-    - return result dict
-    """
-    # basic validation
     if video.content_type is not None and not video.content_type.startswith("video/"):
-        # still allow if browser doesn't provide content_type properly; up to you
         pass
 
     job_dir = _new_job_dir()
@@ -103,7 +101,7 @@ def create_job(
         video_path = job_dir / "inputs" / INPUT_VIDEO_NAME
         _save_upload(video, video_path)
 
-        # Call your backend pipeline (synchronous)
+        # 1) Main pipeline
         result = run_once(
             video_path=str(video_path),
             out_dir=str(job_dir),
@@ -111,17 +109,81 @@ def create_job(
             thresholds_json=thresholds_json,
             enable_annotation=enable_annotation,
             enable_dtw=enable_dtw,
-            show_realtime=False,  # hard-disable in app mode
+            show_realtime=False,
         )
+
+        # 2) Side-by-side generation + write back to manifest
+        try:
+            manifest_path = job_dir / "outputs" / "manifest.json"
+            if enable_dtw and manifest_path.exists():
+                manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
+                throws = manifest_obj.get("throws", []) or []
+
+                for t in throws:
+                    throw_id = t.get("throw_id")
+                    if not throw_id:
+                        continue
+
+                    throw_dir = job_dir / "throws" / throw_id
+                    map_csv = throw_dir / "clip_pose_align_map.csv"
+                    if not map_csv.exists():
+                        continue
+
+                    aligned_frame_csv = throw_dir / "clip_pose_aligned_frame.csv"
+                    student_annot = throw_dir / "annotated.mp4"
+                    student_clip = throw_dir / "clip.mp4"
+                    student_video = str(student_annot if student_annot.exists() else student_clip)
+
+                    out_name = "side_by_side.mp4"
+                    out_name_paused = "side_by_side_paused.mp4"
+                    out_path = throw_dir / out_name
+                    out_path_paused = throw_dir / out_name_paused
+                    
+                    # sanitize UI params
+                    sbs_threshold = max(0.0, min(float(sbs_threshold), 1.0))
+                    sbs_pause_seconds = max(0.0, min(float(sbs_pause_seconds), 5.0))
+                    sbs_min_gap = max(0, int(sbs_min_gap))
+
+                    render_side_by_side(
+                        student_mp4=student_video,
+                        model_video=str(DEFAULT_MODEL_CLIP),
+                        map_csv=str(map_csv),
+                        out_path=str(out_path),
+                        out_path_paused=(str(out_path_paused) if aligned_frame_csv.exists() else None),
+                        aligned_frame_csv=(str(aligned_frame_csv) if aligned_frame_csv.exists() else None),
+                        err_threshold=sbs_threshold,
+                        pause_seconds=sbs_pause_seconds,
+                        min_gap_frames=sbs_min_gap,
+                        flip_model=False,
+                        debug_text=False,
+                    )
+                    
+                    ensure_browser_mp4(Path(out_path))
+                    if aligned_frame_csv.exists():
+                        ensure_browser_mp4(Path(out_path_paused))
+
+                    
+                    # write ABSOLUTE URL into manifest (same style as "video")
+                    manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    for tt in manifest_obj.get("throws", []) or []:
+                        if tt.get("throw_id") == throw_id:
+                            tt["side_by_side_video"] = f"/runs/{job_id}/throws/{throw_id}/{out_name}"
+                            if aligned_frame_csv.exists():
+                                tt["side_by_side_paused_video"] = f"/runs/{job_id}/throws/{throw_id}/{out_name_paused}"
+                            break
+                    manifest_path.write_text(json.dumps(manifest_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        except Exception as e:
+            print(f"[WARN] side-by-side render skipped/failed: {e}")
 
         _write_job_status(job_dir, "done", extra={"result": result})
 
+        # 3) IMPORTANT: always return JSON here
         return JSONResponse(
             {
                 "job_id": job_id,
                 "status": "done",
                 "result": result,
-                # handy URLs
                 "job_url": f"/api/jobs/{job_id}",
                 "download_url": f"/api/jobs/{job_id}/download",
             }
@@ -130,6 +192,7 @@ def create_job(
     except Exception as e:
         _write_job_status(job_dir, "failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail=f"Job failed: {e}")
+
 
 
 @app.get("/api/jobs/{job_id}")

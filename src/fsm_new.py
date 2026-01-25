@@ -29,6 +29,8 @@ from typing import Optional, Dict, Any, List
 import sys
 import re
 import subprocess
+import argparse
+
 
 _THIS_DIR = Path(__file__).resolve().parent  # .../src
 if str(_THIS_DIR) not in sys.path:
@@ -792,7 +794,7 @@ class TennisDetector:
                         if row["upper_speed_smooth"] < 0.08: best_start = i; break
                 else: best_start = max(standing_frame, release_frame - int(1.5*fps))
 
-            final_start = max(standing_frame, best_start - 10)
+            final_start = max(standing_frame, best_start - 0)
             throw_start_frames.append(final_start)
         
         # Plot (Skipping for brevity, keeping original logic effectively)
@@ -834,7 +836,7 @@ class TennisDetector:
 
             
             # Buffer setting: frames after release to keep (e.g., 30 frames ~ 1 sec)
-            post_release_buffer = 10 
+            post_release_buffer = 0 
             
             for i, (ts_idx, rel_idx) in enumerate(zip(throw_start_frames, release_frames)):
                 # Get actual frame numbers from DataFrame
@@ -1076,7 +1078,7 @@ def run_single_throw_dtw(
     thresholds: dict,
     out_json: str,
     *,
-    save_frame_csv: bool = False,
+    save_frame_csv: bool = True,
 ):
     from fixed_dtw_comparison import FixedMotionDTW
     import json
@@ -1084,10 +1086,12 @@ def run_single_throw_dtw(
 
     comparator = FixedMotionDTW(reference_csv, reference_handedness="auto")
     scores, frame_dists, meta = comparator.compare(
-        student_csv=sample_csv,
-        handedness="auto",
-        save_frame_csv=save_frame_csv
-    )
+    student_csv=sample_csv,
+    handedness="auto",
+    save_frame_csv=save_frame_csv,
+    use_pose_align=True,
+    save_align_path=True,
+)
 
     features_out = {}
     for k in comparator.FEATURE_NAMES:

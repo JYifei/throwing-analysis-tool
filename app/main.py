@@ -1,26 +1,38 @@
 from __future__ import annotations
 
+import cv2
 import os
 import json
 import shutil
 import zipfile
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Optional, Dict, Any
 from uuid import uuid4
 from datetime import datetime
 from fastapi.responses import HTMLResponse
+import pandas as pd
+import numpy as np
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from src.fsm_new import ensure_browser_mp4
+from src.fsm_new import ensure_browser_mp4, run_once
+from src.render_side_by_side import (
+    global_bbox_from_csv,
+    crop_video_to_rect,
+    crop_csv_to_rect,
+    _expand_rect_to_size,
+    render_side_by_side_points,
+    compute_mean_normalized_error,
+    MAIN_JOINTS,
+    read_map_csv,
+    _load_xy_pairs_cached,
+)
+from src.criteria_eval import evaluate_criteria
 
 
-# Import your backend entrypoint
-# Make sure your project root is on PYTHONPATH when running uvicorn.
-from src.fsm_new import run_once
-from src.render_side_by_side import render_side_by_side, update_manifest
 
 DEFAULT_MODEL_CLIP = Path(os.environ.get("THROWING_MODEL_CLIP", "reference/model_clip.mp4")).resolve()
 
@@ -48,6 +60,45 @@ def ui_home():
 # This is convenient for debugging and simple UI.
 RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/runs", StaticFiles(directory=str(RUNS_ROOT)), name="runs")
+
+def _get_median_torso_length(csv_path: str) -> Optional[float]:
+    """
+    通过读取 CSV 中的肩膀和髋部坐标，计算该视频中人物躯干的平均(中位数)像素长度。
+    """
+    try:
+        df = pd.read_csv(csv_path)
+        lsx = pd.to_numeric(df['left_shoulder_x'], errors='coerce')
+        lsy = pd.to_numeric(df['left_shoulder_y'], errors='coerce')
+        rsx = pd.to_numeric(df['right_shoulder_x'], errors='coerce')
+        rsy = pd.to_numeric(df['right_shoulder_y'], errors='coerce')
+        
+        lhx = pd.to_numeric(df['left_hip_x'], errors='coerce')
+        lhy = pd.to_numeric(df['left_hip_y'], errors='coerce')
+        rhx = pd.to_numeric(df['right_hip_x'], errors='coerce')
+        rhy = pd.to_numeric(df['right_hip_y'], errors='coerce')
+        
+        msx, msy = (lsx + rsx) / 2.0, (lsy + rsy) / 2.0
+        mhx, mhy = (lhx + rhx) / 2.0, (lhy + rhy) / 2.0
+        
+        dist = np.sqrt((msx - mhx)**2 + (msy - mhy)**2)
+        median_dist = float(np.nanmedian(dist))
+        
+        return median_dist if np.isfinite(median_dist) and median_dist > 0 else None
+    except Exception:
+        return None
+
+
+def _read_facing(csv_path: str):
+    try:
+        df = pd.read_csv(csv_path)
+        if "body_facing" not in df.columns:
+            return None
+        s = df["body_facing"].dropna().astype(str)
+        if s.empty:
+            return None
+        return s.value_counts().idxmax()  # 多数投票
+    except Exception:
+        return None
 
 
 def _new_job_dir() -> Path:
@@ -81,15 +132,14 @@ def health():
 @app.post("/api/jobs")
 def create_job(
     video: UploadFile = File(...),
-    enable_annotation: bool = Form(True),
-    enable_dtw: bool = Form(True),
     reference_csv: str = Form(str(DEFAULT_REFERENCE_CSV)),
     thresholds_json: str = Form(str(DEFAULT_THRESHOLDS_JSON)),
-    sbs_threshold: float = Form(0.35),
-    sbs_pause_seconds: float = Form(0.8),
-    sbs_min_gap: int = Form(12),
+    green_yellow: float = Form(0.25),  # normalized distance
+    yellow_red: float = Form(0.50),
 ):
+
     if video.content_type is not None and not video.content_type.startswith("video/"):
+        # allow anyway; some browsers send application/octet-stream
         pass
 
     job_dir = _new_job_dir()
@@ -107,78 +157,185 @@ def create_job(
             out_dir=str(job_dir),
             reference_csv=reference_csv,
             thresholds_json=thresholds_json,
-            enable_annotation=enable_annotation,
-            enable_dtw=enable_dtw,
+            enable_annotation=False,  # IMPORTANT
+            enable_dtw=True,          # IMPORTANT (align map comes from here)
             show_realtime=False,
         )
+
 
         # 2) Side-by-side generation + write back to manifest
         try:
             manifest_path = job_dir / "outputs" / "manifest.json"
-            if enable_dtw and manifest_path.exists():
-                manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
-                throws = manifest_obj.get("throws", []) or []
+            if not manifest_path.exists():
+                raise RuntimeError("manifest.json missing")
 
-                for t in throws:
-                    throw_id = t.get("throw_id")
-                    if not throw_id:
-                        continue
+            manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
+            throws = manifest_obj.get("throws", []) or []
 
-                    throw_dir = job_dir / "throws" / throw_id
-                    map_csv = throw_dir / "clip_pose_align_map.csv"
-                    if not map_csv.exists():
-                        continue
+            for t in throws:
+                throw_id = t.get("throw_id")
+                if not throw_id:
+                    continue
 
-                    aligned_frame_csv = throw_dir / "clip_pose_aligned_frame.csv"
-                    student_annot = throw_dir / "annotated.mp4"
-                    student_clip = throw_dir / "clip.mp4"
-                    student_video = str(student_annot if student_annot.exists() else student_clip)
+                throw_dir = job_dir / "throws" / throw_id
+                map_csv = throw_dir / "clip_pose_align_map.csv"
+                if not map_csv.exists():
+                    continue
 
-                    out_name = "side_by_side.mp4"
-                    out_name_paused = "side_by_side_paused.mp4"
-                    out_path = throw_dir / out_name
-                    out_path_paused = throw_dir / out_name_paused
-                    
-                    # sanitize UI params
-                    sbs_threshold = max(0.0, min(float(sbs_threshold), 1.0))
-                    sbs_pause_seconds = max(0.0, min(float(sbs_pause_seconds), 5.0))
-                    sbs_min_gap = max(0, int(sbs_min_gap))
+                student_clip = throw_dir / "clip.mp4"
+                stu_csv = throw_dir / "clip.csv"
+                if not (student_clip.exists() and stu_csv.exists()):
+                    continue
 
-                    render_side_by_side(
-                        student_mp4=student_video,
-                        model_video=str(DEFAULT_MODEL_CLIP),
-                        map_csv=str(map_csv),
-                        out_path=str(out_path),
-                        out_path_paused=(str(out_path_paused) if aligned_frame_csv.exists() else None),
-                        aligned_frame_csv=(str(aligned_frame_csv) if aligned_frame_csv.exists() else None),
-                        err_threshold=sbs_threshold,
-                        pause_seconds=sbs_pause_seconds,
-                        min_gap_frames=sbs_min_gap,
-                        flip_model=False,
-                        debug_text=False,
-                    )
-                    
-                    ensure_browser_mp4(Path(out_path))
-                    if aligned_frame_csv.exists():
-                        ensure_browser_mp4(Path(out_path_paused))
+                # ---------- 1) Compute student crop rect ----------
+                cap_tmp = cv2.VideoCapture(str(student_clip))
+                ok, first_frame = cap_tmp.read()
+                cap_tmp.release()
+                if not ok or first_frame is None:
+                    continue
+                hs, ws = first_frame.shape[:2]
+                rect_s = global_bbox_from_csv(str(stu_csv), ws, hs, margin_px=200)
+                if not rect_s:
+                    continue
 
-                    
-                    # write ABSOLUTE URL into manifest (same style as "video")
-                    manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    for tt in manifest_obj.get("throws", []) or []:
-                        if tt.get("throw_id") == throw_id:
-                            tt["side_by_side_video"] = f"/runs/{job_id}/throws/{throw_id}/{out_name}"
-                            if aligned_frame_csv.exists():
-                                tt["side_by_side_paused_video"] = f"/runs/{job_id}/throws/{throw_id}/{out_name_paused}"
-                            break
-                    manifest_path.write_text(json.dumps(manifest_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+                # ---------- 2) Model crop rect ----------
+                cap_m = cv2.VideoCapture(str(DEFAULT_MODEL_CLIP))
+                okm, firstm = cap_m.read()
+                cap_m.release()
+                if not okm or firstm is None:
+                    continue
+                hm, wm = firstm.shape[:2]
+                rect_m = global_bbox_from_csv(str(reference_csv), wm, hm, margin_px=200)
+                if not rect_m:
+                    continue
+
+                # ---------- 3) Expand rects to same W/H so coordinate spaces are comparable ----------
+                TW = max(rect_s[2] - rect_s[0], rect_m[2] - rect_m[0])
+                TH = max(rect_s[3] - rect_s[1], rect_m[3] - rect_m[1])
+                rect_s = _expand_rect_to_size(rect_s, TW, TH, ws, hs)
+                rect_m = _expand_rect_to_size(rect_m, TW, TH, wm, hm)
+                
+                
+                # ---------- 4) Student cropped assets (MOVED HERE: AFTER expand) ----------
+                crop_clip = throw_dir / "clip_crop.mp4"
+                crop_csv = throw_dir / "clip_crop.csv"
+
+                # 建议先覆盖生成，避免旧文件与新 rect 不一致
+                crop_video_to_rect(str(student_clip), str(crop_clip), rect_s, flip=False)
+                crop_csv_to_rect(str(stu_csv), str(crop_csv), rect_s)
+
+                # ---------- 5) Build model crop video + crop CSV (NEW) ----------
+                model_crop = throw_dir / "model_crop.mp4"
+                model_crop_csv = throw_dir / "model_crop.csv"
+
+                crop_video_to_rect(str(DEFAULT_MODEL_CLIP), str(model_crop), rect_m, flip=False)
+                crop_csv_to_rect(str(reference_csv), str(model_crop_csv), rect_m)
+
+                # ---------- 6) Auto flip decision ----------
+                flip_needed = False
+                stu_facing = _read_facing(str(stu_csv))
+                ref_facing = _read_facing(str(reference_csv))
+                flip_needed = (stu_facing is not None and ref_facing is not None and stu_facing != ref_facing)
+
+                # ---------- 7) Render final video (ONLY ONE MODE) ----------
+                out_name = "compare.mp4"
+                out_path = throw_dir / out_name
+
+                render_side_by_side_points(
+                    student_mp4=str(crop_clip),
+                    model_mp4=str(model_crop),
+                    map_csv=str(map_csv),
+                    student_csv=str(crop_csv),
+                    model_csv=str(model_crop_csv),
+                    out_path=str(out_path),
+                    flip_model=flip_needed,
+                    green_yellow=float(green_yellow),
+                    yellow_red=float(yellow_red),
+                )
+                ensure_browser_mp4(Path(out_path))
+
+                # ---------- 8) Compute criteria.json (REAL) ----------
+                criteria_path = throw_dir / "criteria.json"
+
+                criteria_obj = evaluate_criteria(
+                    student_csv=str(crop_csv),          # clip_crop.csv
+                    model_csv=str(model_crop_csv),      # model_crop.csv
+                    map_csv=str(map_csv),               # clip_pose_align_map.csv
+                    model_windows=None,                 # 先用 src/criteria_eval.py 里的 DEFAULT_MODEL_WINDOWS
+                )
+
+                criteria_path.write_text(
+                    json.dumps(criteria_obj, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+
+
+                # ---------- 9) score.json (mean_err -> matching_percent) ----------
+                score_path = throw_dir / "score.json"
+
+                # --- 【同步修改】基于解剖学(躯干长度)进行动态缩放 ---
+                stu_torso = _get_median_torso_length(str(crop_csv))
+                mdl_torso = _get_median_torso_length(str(model_crop_csv))
+                
+                if stu_torso is not None and mdl_torso is not None:
+                    dynamic_scale = stu_torso / mdl_torso
+                else:
+                    dynamic_scale = hs / max(hm, 1)
+                # ---------------------------------------------------
+
+                mean_err = compute_mean_normalized_error(
+                    map_s_to_m=read_map_csv(str(map_csv)),
+                    stu_xy=_load_xy_pairs_cached(str(crop_csv)),
+                    mdl_xy=_load_xy_pairs_cached(str(model_crop_csv)),
+                    ws=ws,
+                    out_h=hs,
+                    wm=wm,
+                    model_scale=dynamic_scale,  # <== 使用人体物理比例缩放
+                    flip_model=flip_needed,
+                    joints=[j for j in MAIN_JOINTS],
+                )
+
+                k = 0.20
+                l = 1.80
+                if not np.isfinite(mean_err):
+                    matching = 0.0
+                elif mean_err <= k:
+                    matching = 100.0
+                elif mean_err >= l:
+                    matching = 0.0
+                else:
+                    matching = 100.0 * (l - mean_err) / (l - k)
+
+                score_obj = {
+                    "matching_percent": round(float(matching), 1),
+                    "mean_normalized_error": round(float(mean_err), 4),
+                    "mapping": {
+                        "k_full_score": k,
+                        "l_zero_score": l,
+                        "rule": f"e<={k} ->100; {k}<e<{l} -> linear; e>={l} ->0",
+                    },
+                }
+                score_path.write_text(json.dumps(score_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+                # ---------- 9) Update manifest entry ----------
+                for tt in manifest_obj.get("throws", []) or []:
+                    if tt.get("throw_id") == throw_id:
+                        # Keep original "video" (usually clip.mp4) for backward compatibility
+                        tt["video"] = f"/runs/{job_id}/throws/{throw_id}/{out_name}"
+                        tt["compare_video"] = f"/runs/{job_id}/throws/{throw_id}/{out_name}"
+                        tt["criteria"] = f"/runs/{job_id}/throws/{throw_id}/criteria.json"
+                        tt["score"] = f"/runs/{job_id}/throws/{throw_id}/score.json"
+                        break
+
+            # write manifest once
+            manifest_path.write_text(json.dumps(manifest_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
         except Exception as e:
             print(f"[WARN] side-by-side render skipped/failed: {e}")
 
         _write_job_status(job_dir, "done", extra={"result": result})
 
-        # 3) IMPORTANT: always return JSON here
         return JSONResponse(
             {
                 "job_id": job_id,
@@ -192,7 +349,6 @@ def create_job(
     except Exception as e:
         _write_job_status(job_dir, "failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail=f"Job failed: {e}")
-
 
 
 @app.get("/api/jobs/{job_id}")

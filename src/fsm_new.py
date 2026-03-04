@@ -138,10 +138,10 @@ class TennisDetector:
         # Original code (in __init__)
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
-            model_complexity=1,            # Current setting (medium model)
+            model_complexity=2,            # Current setting (medium model)
             enable_segmentation=False,
-            min_detection_confidence=0.5,  # Current setting (too loose)
-            min_tracking_confidence=0.5    # Current setting (too loose)
+            min_detection_confidence=0.4,  # Current setting (too loose)
+            min_tracking_confidence=0.3    # Current setting (too loose)
         )
         
         
@@ -226,8 +226,18 @@ class TennisDetector:
         if rot_degrees in (180, -180): return cv2.ROTATE_180
         return None
 
-    def detect_video(self, video_path, output_path='output_detection.mp4',
-                  show_realtime=True, use_tracker=False, img_size=640, video_dir=None):
+    def detect_video(
+        self,
+        video_path,
+        output_path='output_detection.mp4',
+        show_realtime=True,
+        use_tracker=False,
+        img_size=640,
+        video_dir=None,
+        *,
+        save_detection_video: bool = True,  # NEW: 是否写 output_detection_with_pose.mp4
+        save_clip_video: bool = True,       # NEW: 是否写 throws/throw_xxx/clip.mp4
+    ):
         cap = cv2.VideoCapture(video_path)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -251,8 +261,9 @@ class TennisDetector:
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         # Fix: VideoWriter uses rotated width and height
-        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (out_width, out_height))
-
+        out = None
+        if save_detection_video:
+            out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (out_width, out_height))
         # --- preview window setup ---
         WIN = "Detection with Pose"
         PREVIEW_W = 960
@@ -274,6 +285,10 @@ class TennisDetector:
         stand_frames = max(1, int(1.0 * fps))
         v_thresh = 0.08
         speed_norm_buffer = deque(maxlen=stand_frames)
+        # --- facing latch (session-level) ---
+        facing_buffer = deque(maxlen=stand_frames)   # 存最近 stand_frames 的 raw facing
+        session_facing = None                        # 一旦standing触发就锁定
+        session_throwing_hand = None                 # 跟着session_facing固定
         buffer_frames = int(0.5 * fps)
         cooldown_frames_remaining = 0
         ball_frames_in_session = []
@@ -369,6 +384,12 @@ class TennisDetector:
                         shoulder_mid_x_pixel = float(row['shoulder_mid_x'])
                     body_facing = row['body_facing'] if 'body_facing' in row else None
                     
+                    # record raw facing vote for later majority voting (cache path)
+                    if body_facing in ("left", "right"):
+                        facing_buffer.append(body_facing)
+                    else:
+                        facing_buffer.append(None)
+                    
                     cache_hit = True
                 except Exception as e:
                     pass
@@ -460,22 +481,29 @@ class TennisDetector:
                               body_facing = "right" if nose.x > shoulder_mid_x else "left"
                           else:
                               body_facing = "right" if rs.x > ls.x else "left"
+                    if body_facing in ("left", "right"):
+                        facing_buffer.append(body_facing)
+                    else:
+                        facing_buffer.append(None)
 
-                    # === AUTO-SELECT THROWING HAND based on body_facing ===
-                    # Determine which hand to track based on facing direction
-                    if body_facing == "left":
-                        # Person facing left -> use LEFT hand
-                        throwing_hand = "left"
+                    # === AUTO-SELECT THROWING HAND (locked during detecting_throw) ===
+                    # use locked facing if we are in a throw session
+                    facing_used = session_facing if (detection_state == "detecting_throw" and session_facing in ("left", "right")) else body_facing
+
+                    if detection_state == "detecting_throw" and session_throwing_hand in ("left", "right"):
+                        throwing_hand = session_throwing_hand
+                    else:
+                        throwing_hand = "left" if facing_used == "left" else "right"  # default right if None/unknown
+
+                    if throwing_hand == "left":
                         active_wrist = left_wrist
                         active_elbow = left_elbow
                         active_forearm = left_forearm_length
                     else:
-                        # Person facing right or uncertain -> use RIGHT hand (default)
-                        throwing_hand = "right"
                         active_wrist = right_wrist
                         active_elbow = right_elbow
                         active_forearm = forearm_length
-                    
+                                        
                     # Update the tracking variables to use the selected hand
                     if active_wrist:
                         right_wrist = active_wrist  # Keep variable name for compatibility
@@ -538,19 +566,33 @@ class TennisDetector:
                     valid_speeds = [s for s in recent_speeds if not np.isnan(s)]
                     if valid_speeds and (len(valid_speeds) / stand_frames) >= 0.8:
                         if all(s < v_thresh for s in valid_speeds):
+                            # --- LOCK facing here (majority vote over facing_buffer) ---
+                            votes = [v for v in list(facing_buffer) if v in ("left", "right")]
+                            if votes:
+                                session_facing = "right" if votes.count("right") >= votes.count("left") else "left"
+                            else:
+                                session_facing = body_facing if body_facing in ("left", "right") else None
+
+                            session_throwing_hand = ("left" if session_facing == "left"
+                                                    else "right" if session_facing == "right"
+                                                    else None)
+
                             detection_state = "detecting_throw"
                             standing_frames_rt.append(frame_count)
                             cooldown_frames_remaining = 0
                             ball_frames_in_session = []
                             release_detected_by_ratio = False
-                            print(f"[Frame {frame_count:5d}] STANDING DETECTED")
-            
+                            print(f"[Frame {frame_count:5d}] STANDING DETECTED | latch={session_facing}")
+                                    
             elif detection_state == "detecting_throw":
                 if cooldown_frames_remaining > 0:
                     cooldown_frames_remaining -= 1
                     if cooldown_frames_remaining == 0:
                         detection_state = "waiting_for_standing"
-                
+                        session_facing = None
+                        session_throwing_hand = None
+                        facing_buffer.clear()
+                                    
                 # Person lost fallback
                 elif (not cache_hit and not pose_results.pose_landmarks) or (cache_hit and not right_wrist):
                      if not release_detected_by_ratio and len(ball_frames_in_session) > 0:
@@ -562,6 +604,9 @@ class TennisDetector:
                         release_frames_rt.append(best_frame['frame'])
                         print(f"[Frame {best_frame['frame']:5d}] Fallback release")
                      detection_state = "waiting_for_standing"
+                     session_facing = None
+                     session_throwing_hand = None
+                     facing_buffer.clear()
 
             # Drawing (HUD)
             if right_wrist: cv2.circle(frame, right_wrist, 6, (255, 0, 0), -1)
@@ -574,7 +619,8 @@ class TennisDetector:
             cv2.putText(frame, f"Frame: {frame_count}/{total_frames} | FPS: {fps}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
             
             # === [Fix 1] Write video frame ===
-            out.write(frame)
+            if out is not None:
+                out.write(frame)
             
             # === [Fix 2] Realtime preview ===
             if show_realtime:
@@ -607,7 +653,7 @@ class TennisDetector:
                 'ball_x': closest_ball[0] if closest_ball else np.nan,
                 'ball_y': closest_ball[1] if closest_ball else np.nan,
                 'hip_y': hip_y if hip_y is not None else np.nan,
-                'body_facing': body_facing,
+                'body_facing': facing_used if 'facing_used' in locals() else body_facing,
                 'throwing_hand': throwing_hand if 'throwing_hand' in locals() else 'right',
                 'is_fallback_release': False,
                 'shoulder_mid_x': shoulder_mid_x_pixel,
@@ -637,9 +683,10 @@ class TennisDetector:
                         ratio_diff = ratio - prev_ratio
                         cond_forward_rt = True
                         if shoulder_mid_x_pixel is not None:
-                            if body_facing == "right":
+                            ff = facing_used if 'facing_used' in locals() else body_facing
+                            if ff == "right":
                                 cond_forward_rt = closest_ball[0] > shoulder_mid_x_pixel
-                            elif body_facing == "left":
+                            elif ff == "left":
                                 cond_forward_rt = closest_ball[0] < shoulder_mid_x_pixel
 
                         if ratio_diff > diff_thresh and ratio > abs_thresh and cond_forward_rt:
@@ -650,17 +697,42 @@ class TennisDetector:
                                 all_records[-1]["is_rt_release"] = True
                                 print(f"[Frame {frame_count:5d}] Release detected, buffer started")
 
+        # 视频逐帧读取的 while 循环结束
+
+        # === [新增：视频结束时的挂起状态处理 (EOF Fallback)] ===
+        if detection_state == "detecting_throw":
+            if len(ball_frames_in_session) > 0:
+                # 如果记录到了球，使用最后一帧有球的画面作为 Fallback release
+                best_frame = ball_frames_in_session[-1]['frame']
+                for rec in all_records:
+                    if rec['frame'] == best_frame:
+                        rec['is_fallback_release'] = True
+                        break
+                release_frames_rt.append(best_frame)
+                print(f"[EOF] Hanging session resolved with Fallback release at frame {best_frame}")
+            else:
+                # 如果没记录到球（纯粹的假动作站立），直接丢弃
+                print("[EOF] Hanging session discarded (no ball detected).")
+
+        # === 收尾清理 ===
         state_log.close()
         cap.release()
-        out.release()
+        if out is not None:
+            out.release()
         cv2.destroyAllWindows()
         self.pose.close()
         
         df = pd.DataFrame(all_records)
+        
+        # 👇👇👇 [关键修复：将帧号设为表格的绝对索引，防止 .loc 越界] 👇👇👇
+        df.set_index('frame', drop=False, inplace=True)
+        # 👆👆👆 =================================================== 👆👆👆
+
         print("\nDetection complete.")
 
         if df.empty:
             return df, []
+        
         
         # === Cache saving ===
         if df_cache is None:
@@ -836,7 +908,7 @@ class TennisDetector:
 
             
             # Buffer setting: frames after release to keep (e.g., 30 frames ~ 1 sec)
-            post_release_buffer = 0 
+            post_release_buffer = 10 
             
             for i, (ts_idx, rel_idx) in enumerate(zip(throw_start_frames, release_frames)):
                 # Get actual frame numbers from DataFrame
@@ -865,24 +937,30 @@ class TennisDetector:
                 clip_path = str(throw_dir / clip_name)
                 # --- record OK event (index for UI) ---
                 throw_dir_rel = str(Path("throws") / f"throw_{throw_id:03d}")
-                events.append({
+                ev_obj = {
                     "throw_id": throw_id,
                     "start_frame": int(start_f),
                     "release_frame": int(df.loc[rel_idx, "frame"]),
                     "end_frame": int(end_f),
                     "status": "ok",
                     "throw_dir": throw_dir_rel,
-                    "clip_video": str(Path(throw_dir_rel) / "clip.mp4"),
-                    "clip_csv": str(Path(throw_dir_rel) / "clip.csv")
-                })
+                    "clip_csv": str(Path(throw_dir_rel) / "clip.csv"),
+                }
+                if save_clip_video:
+                    ev_obj["clip_video"] = str(Path(throw_dir_rel) / "clip.mp4")
+                events.append(ev_obj)
                 
                 # Clip writer setup
-                clip_w = out_width  # Defined earlier (rotated)
-                clip_h = out_height # Defined earlier (rotated)
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out_clip = cv2.VideoWriter(clip_path, fourcc, fps, (clip_w, clip_h))
-                
-                print(f"  -> Saving {clip_name} ({end_f - start_f} frames)")
+                out_clip = None
+                if save_clip_video:
+                    # Clip writer setup
+                    clip_w = out_width  # Defined earlier (rotated)
+                    clip_h = out_height # Defined earlier (rotated)
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out_clip = cv2.VideoWriter(clip_path, fourcc, fps, (clip_w, clip_h))
+                    print(f"  -> Saving {clip_name} ({end_f - start_f} frames)")
+                else:
+                    print(f"  -> Skip clip.mp4 (save_clip_video=False), only clip.csv saved")
                 
                 # === [NEW] Save corresponding CSV data segment ===
                 # Filter out DataFrame data for the current segment
@@ -951,21 +1029,24 @@ class TennisDetector:
                 print(f"     -> Also saved data to {csv_name} ({len(columns_to_save)} columns)")
                 
                 # Jump to start frame
-                cap_clip.set(cv2.CAP_PROP_POS_FRAMES, start_f)
-                
-                for f_num in range(start_f, end_f + 1):
-                    ret_c, frame_c = cap_clip.read()
-                    if not ret_c: break
-                    
-                    # Apply the same rotation as main detection!
-                    if rotate_code is not None:
-                        frame_c = cv2.rotate(frame_c, rotate_code)
-                    
-                    out_clip.write(frame_c)
-                
-                out_clip.release()
-                # Normalize for browser playback
-                ensure_browser_mp4(Path(clip_path))
+                if out_clip is not None:
+                    # Jump to start frame
+                    cap_clip.set(cv2.CAP_PROP_POS_FRAMES, start_f)
+
+                    for f_num in range(start_f, end_f + 1):
+                        ret_c, frame_c = cap_clip.read()
+                        if not ret_c:
+                            break
+
+                        # Apply the same rotation as main detection!
+                        if rotate_code is not None:
+                            frame_c = cv2.rotate(frame_c, rotate_code)
+
+                        out_clip.write(frame_c)
+
+                    out_clip.release()
+                    # Normalize for browser playback
+                    ensure_browser_mp4(Path(clip_path))
 
             
             cap_clip.release()
@@ -1027,8 +1108,10 @@ def run_once(
     show_realtime=False,
     use_tracker=False,
     img_size=1280,
-    video_dir=str(out_dir_p),)
-
+    video_dir=str(out_dir_p),
+    save_detection_video=True,
+    save_clip_video=True,
+)
 
     if not events_path.exists():
         raise FileNotFoundError(f"events.json not found at {events_path}")
@@ -1301,7 +1384,7 @@ if __name__ == "__main__":
         out_dir=out_dir,
         reference_csv="reference/model.csv",
         thresholds_json="config/dtw_thresholds.json",
-        enable_annotation=True,
+        enable_annotation=False,
         enable_dtw=True,
     )
 

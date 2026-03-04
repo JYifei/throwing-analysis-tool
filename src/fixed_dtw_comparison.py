@@ -903,6 +903,357 @@ class FixedMotionDTW:
         print("=" * 70)
 
 
+# =========================
+# Utilities: signed delta + curve png
+# Put this block ABOVE: if __name__ == "__main__":
+# =========================
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+def export_signed_deltas_from_align_map(
+    reference_csv: str,
+    student_csv: str,
+    align_map_csv: str,
+    out_csv: str,
+    handedness: str = "auto",
+    theta0_deg: float = 20.0,
+):
+    """
+    Produce per-frame signed deltas (student - reference) aligned by an existing map CSV.
+    align_map_csv must have columns: stu_idx, ref_idx (like your clip_pose_align_map.csv).
+
+    Output: dtw_signed_delta.csv with columns:
+      frame, ref_idx,
+      <feat>_delta (signed), <feat>_abs, <feat>_rel
+    For angles: _rel equals degrees delta for convenience.
+    """
+    comparator = FixedMotionDTW(reference_csv, reference_handedness="auto")
+
+    student_df = pd.read_csv(student_csv)
+    ref_df = comparator.reference_df
+
+    # infer facing/dominant like compare() does
+    student_facing = comparator._safe_mode(student_df, "body_facing", default="unknown")
+    if handedness in ("left", "right"):
+        dom = handedness
+    else:
+        if student_facing in ("left", "right"):
+            dom = student_facing
+        else:
+            df_norm_for_infer = comparator._normalize_coordinates(student_df, student_facing)
+            dom = comparator._infer_handedness(df_norm_for_infer)
+
+    # extract features
+    ref_feats = comparator.reference_features
+    stu_feats = comparator._extract_features(student_df, facing=student_facing, dominant_side=dom)
+
+    # load mapping
+    map_df = pd.read_csv(align_map_csv)
+    stu_idx = map_df["stu_idx"].astype(int).values
+    ref_idx = map_df["ref_idx"].astype(int).values
+
+    n = len(student_df)
+    out = {
+        "frame": np.arange(n, dtype=int),
+        "ref_idx": np.full(n, -1, dtype=int),
+    }
+
+    # build a fast dict: stu -> ref
+    s2r = {int(s): int(r) for s, r in zip(stu_idx, ref_idx)}
+    for s in range(n):
+        out["ref_idx"][s] = s2r.get(s, -1)
+
+    def _safe_rel_signed(stu_v: float, ref_v: float, eps: float = 1e-6) -> float:
+        if np.isnan(stu_v) or np.isnan(ref_v):
+            return np.nan
+        denom = max(abs(ref_v), eps)
+        return float((stu_v - ref_v) / denom)
+
+    for feat in comparator.FEATURE_NAMES:
+        ref_seq = np.array(ref_feats.get(feat, np.full(len(ref_df), np.nan)), dtype=float)
+        stu_seq = np.array(stu_feats.get(feat, np.full(n, np.nan)), dtype=float)
+
+        ref_seq = comparator._interpolate_sequence(ref_seq)
+        stu_seq = comparator._interpolate_sequence(stu_seq)
+
+        delta = np.full(n, np.nan, dtype=float)
+        absd  = np.full(n, np.nan, dtype=float)
+        rel   = np.full(n, np.nan, dtype=float)
+        refv  = np.full(n, np.nan, dtype=float)  # NEW
+        stuv  = np.full(n, np.nan, dtype=float)  # NEW (optional)
+
+        for s in range(n):
+            r = int(out["ref_idx"][s])
+            if r < 0 or r >= len(ref_seq):
+                continue
+            rv = float(ref_seq[r])
+            sv = float(stu_seq[s])
+            if np.isnan(rv) or np.isnan(sv):
+                continue
+
+            d = sv - rv
+            delta[s] = d
+            absd[s]  = abs(d)
+            refv[s]  = rv
+            stuv[s]  = sv
+
+            if feat in comparator.ANGLE_FEATURES:
+                # signed relative vs model angle at that moment
+                denom = max(abs(rv), float(theta0_deg))
+                rel[s] = float(d / denom)
+            else:
+                # signed relative vs model distance at that moment
+                rel[s] = _safe_rel_signed(sv, rv)
+
+        out[f"{feat}_delta"] = delta
+        out[f"{feat}_abs"]   = absd
+        out[f"{feat}_rel"]   = rel
+        out[f"{feat}_ref"]   = refv   # NEW
+        out[f"{feat}_stu"]   = stuv   # NEW (optional)
+
+    df_out = pd.DataFrame(out)
+    out_path = Path(out_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_csv(out_path, index=False, float_format="%.6f")
+    return str(out_path)
+
+
+def render_curve_png_from_aligned_frame_csv(
+    aligned_frame_csv: str,
+    out_png: str,
+    smooth_window: int = 5,
+    normalize: bool = True,
+    # NEW: if provided, we will draw ABS curves from this signed delta csv instead (recommended)
+    signed_delta_csv: str | None = None,
+    theta0_deg: float = 20.0,   # angle denominator floor for relative normalization
+    cap_abs: float | None = 2.0 # optional cap for abs rel (e.g., 2.0 => 200%) to avoid huge spikes
+):
+    """
+    Draw an ABS curve PNG.
+
+    Priority:
+      1) If signed_delta_csv is provided and exists:
+         - For angles: abs( (stu - ref) / max(|ref|, theta0_deg) )
+           computed from <feat>_delta and a <feat>_ref if exists, else fallback to abs(delta)/180.
+         - For distances: abs(<feat>_rel) if exists, else abs(<feat>_delta)/(abs(ref)+eps) if ref exists.
+         This matches your intention: normalize by the model value at that moment.
+      2) Else fallback to plotting raw columns from aligned_frame_csv (legacy behavior).
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    def smooth(y: np.ndarray, w: int) -> np.ndarray:
+        if w <= 1:
+            return y
+        return pd.Series(y).rolling(w, min_periods=1, center=True).mean().values
+
+    # Feature list should match your pipeline
+    feats = [
+        "elbow_angle",
+        "shoulder_angle",
+        "hip_angle",
+        "feet_lr_dist",
+        "wrist_to_samehip_dist",
+        "wrist_to_opphip_dist",
+        "elbow_to_samehip_dist",
+        "elbow_to_opphip_dist",
+        "shoulder_to_wrist_y_dist",
+        "shoulder_to_elbow_y_dist",
+    ]
+    angle_feats = {"elbow_angle", "shoulder_angle", "hip_angle"}
+
+    # ---------- Preferred path: use signed_delta_csv ----------
+    if signed_delta_csv is not None and Path(signed_delta_csv).exists():
+        df = pd.read_csv(signed_delta_csv)
+        x = df["frame"].values if "frame" in df.columns else np.arange(len(df))
+
+        plt.figure(figsize=(12, 4))
+
+        for feat in feats:
+            if feat in angle_feats:
+                # We expect <feat>_delta in degrees, and ideally <feat>_ref (model angle) if you saved it.
+                delta_col = f"{feat}_delta"
+                ref_col = f"{feat}_ref"  # optional, if you have it
+                if delta_col not in df.columns:
+                    continue
+
+                delta = df[delta_col].astype(float).values
+
+                if normalize:
+                    if ref_col in df.columns:
+                        ref = np.abs(df[ref_col].astype(float).values)
+                        denom = np.maximum(ref, float(theta0_deg))
+                        y = np.abs(delta) / denom
+                    else:
+                        # fallback if ref not available
+                        y = np.abs(delta) / 180.0
+                else:
+                    y = np.abs(delta)
+
+            else:
+                # distances: prefer <feat>_rel (already relative)
+                rel_col = f"{feat}_rel"
+                delta_col = f"{feat}_delta"
+                ref_col = f"{feat}_ref"  # optional
+                if normalize:
+                    if rel_col in df.columns:
+                        y = np.abs(df[rel_col].astype(float).values)
+                    elif delta_col in df.columns and ref_col in df.columns:
+                        delta = df[delta_col].astype(float).values
+                        ref = np.abs(df[ref_col].astype(float).values)
+                        denom = ref + 1e-6
+                        y = np.abs(delta) / denom
+                    elif delta_col in df.columns:
+                        # last resort: absolute delta (no good normalization available)
+                        y = np.abs(df[delta_col].astype(float).values)
+                    else:
+                        continue
+                else:
+                    if rel_col in df.columns:
+                        y = np.abs(df[rel_col].astype(float).values)
+                    elif delta_col in df.columns:
+                        y = np.abs(df[delta_col].astype(float).values)
+                    else:
+                        continue
+
+            if cap_abs is not None:
+                y = np.clip(y, 0.0, float(cap_abs))
+
+            y = smooth(y, smooth_window)
+            plt.plot(x, y, label=feat)
+
+        plt.xlabel("frame")
+        plt.ylabel("abs relative error" if normalize else "abs error")
+        plt.title("DTW per-frame ABS error curves (relative to model)")
+        plt.legend(ncol=3, fontsize=8)
+        plt.tight_layout()
+
+        out_path = Path(out_png)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=160)
+        plt.close()
+        return str(out_path)
+
+    # ---------- Fallback: legacy behavior ----------
+    df = pd.read_csv(aligned_frame_csv)
+    x = df["frame"].values if "frame" in df.columns else np.arange(len(df))
+
+    cols = [c for c in df.columns if c != "frame"]
+    plt.figure(figsize=(12, 4))
+    for c in cols:
+        y = df[c].values.astype(float)
+        y = smooth(y, smooth_window)
+        plt.plot(x, y, label=c)
+
+    plt.xlabel("frame")
+    plt.ylabel("aligned error")
+    plt.title("DTW aligned per-frame error curves (legacy)")
+    plt.legend(ncol=3, fontsize=8)
+    plt.tight_layout()
+
+    out_path = Path(out_png)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+    return str(out_path)
+
+
+def render_signed_curve_png_from_signed_delta_csv(
+    signed_delta_csv: str,
+    out_png: str,
+    use_rel_for_dist: bool = True,
+    normalize_angles: bool = True,   # now means "use relative for angles if possible"
+    theta0_deg: float = 20.0,
+    cap_signed: float | None = 2.0,
+    smooth_window: int = 5,
+):
+    """
+    Draw a SIGNED curve PNG from dtw_signed_delta.csv.
+
+    - Dist features:
+        * if use_rel_for_dist=True: use <feat>_rel (preferred)
+        * else: use <feat>_delta
+    - Angle features (degrees):
+        * preferred: use <feat>_rel if present (relative to model at that moment)
+        * else if <feat>_ref exists: use (delta / max(|ref|, theta0_deg))
+        * else fallback: use delta/180
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    df = pd.read_csv(signed_delta_csv)
+    x = df["frame"].values if "frame" in df.columns else np.arange(len(df))
+
+    def smooth(y: np.ndarray, w: int) -> np.ndarray:
+        if w <= 1:
+            return y
+        return pd.Series(y).rolling(w, min_periods=1, center=True).mean().values
+
+    angle_feats = {"elbow_angle", "shoulder_angle", "hip_angle"}
+
+    feats = [
+        "elbow_angle",
+        "shoulder_angle",
+        "hip_angle",
+        "feet_lr_dist",
+        "wrist_to_samehip_dist",
+        "wrist_to_opphip_dist",
+        "elbow_to_samehip_dist",
+        "elbow_to_opphip_dist",
+        "shoulder_to_wrist_y_dist",
+        "shoulder_to_elbow_y_dist",
+    ]
+
+    plt.figure(figsize=(12, 4))
+
+    for feat in feats:
+        if feat in angle_feats:
+            rel_col = f"{feat}_rel"
+            delta_col = f"{feat}_delta"
+            ref_col = f"{feat}_ref"  # optional
+
+            if normalize_angles and rel_col in df.columns:
+                y = df[rel_col].astype(float).values
+            elif delta_col in df.columns and ref_col in df.columns:
+                delta = df[delta_col].astype(float).values
+                ref = np.abs(df[ref_col].astype(float).values)
+                denom = np.maximum(ref, float(theta0_deg))
+                y = delta / denom
+            elif delta_col in df.columns:
+                # fallback
+                y = df[delta_col].astype(float).values / 180.0 if normalize_angles else df[delta_col].astype(float).values
+            else:
+                continue
+
+        else:
+            col = f"{feat}_rel" if use_rel_for_dist else f"{feat}_delta"
+            if col not in df.columns:
+                continue
+            y = df[col].astype(float).values
+
+        if cap_signed is not None:
+            y = np.clip(y, -float(cap_signed), float(cap_signed))
+
+        y = smooth(y, smooth_window)
+        plt.plot(x, y, label=feat)
+
+    plt.axhline(0.0, linewidth=1)
+    plt.xlabel("frame")
+    plt.ylabel("signed relative error" if normalize_angles else "signed delta")
+    plt.title("DTW signed per-frame deltas (student vs model)")
+    plt.legend(ncol=3, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+    return out_png
+
+
+
 if __name__ == "__main__":
 
     # Example usage (project-root relative)

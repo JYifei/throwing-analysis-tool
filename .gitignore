@@ -46,3 +46,7 @@ output/
 # Virtual environments
 .venv/
 venv/
+
+
+*.json
+*.png

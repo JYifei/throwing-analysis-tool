@@ -464,10 +464,10 @@ def render_side_by_side_points(
             err = float(np.sqrt(dx * dx + dy * dy))
 
             color = _color_from_err(err, green_yellow, yellow_red)
-            cv2.circle(sf, (int(round(sx)), int(round(sy))), point_radius, color, thickness=-1)
+            #cv2.circle(sf, (int(round(sx)), int(round(sy))), point_radius, color, thickness=-1)
             
             # === 修改点 2：使用未缩放的 draw_mx 和 draw_my 画白点 ===
-            cv2.circle(mf, (int(round(draw_mx)), int(round(draw_my))), point_radius, (200, 200, 200), thickness=-1)
+            #cv2.circle(mf, (int(round(draw_mx)), int(round(draw_my))), point_radius, (200, 200, 200), thickness=-1)
         # Concatenate and write
         sbs = make_side_by_side(sf, mf, out_h=out_h)
         if sbs is None:

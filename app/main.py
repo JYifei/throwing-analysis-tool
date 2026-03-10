@@ -295,8 +295,8 @@ def create_job(
                     joints=[j for j in MAIN_JOINTS],
                 )
 
-                k = 0.20
-                l = 1.80
+                k = 0.10
+                l = 1.30
                 if not np.isfinite(mean_err):
                     matching = 0.0
                 elif mean_err <= k:

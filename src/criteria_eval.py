@@ -496,6 +496,167 @@ def crit4_hand_across_body_towards_opposite_hip_details(
     )
 
 
+def crit_throw_higher_details(
+    df: pd.DataFrame,
+    a: int,
+    b: int,
+    *,
+    target_sign: int,
+) -> CriterionDebug:
+    """
+    Detect whether the ball is released too low.
+    We use the early post-release ball trajectory inside a short tail window.
+
+    target_sign:
+        +1 -> forward is increasing x
+        -1 -> forward is decreasing x
+    """
+    bx, by = load_xy(df, "ball")
+
+    a = max(0, int(a))
+    b = min(len(bx) - 1, int(b))
+    if b <= a:
+        return _fail(["invalid_window"], valid_frames=0)
+
+    seg_bx = bx[a:b+1]
+    seg_by = by[a:b+1]
+
+    m = np.isfinite(seg_bx) & np.isfinite(seg_by)
+    valid_idx = np.where(m)[0]
+
+    if len(valid_idx) < 3:
+        return _fail(["too_few_valid_ball_frames"], valid_frames=int(m.sum()))
+
+    # Use the earliest valid ball points in the tail window to approximate
+    # the initial post-release direction, instead of using the full tail.
+    p0_rel = int(valid_idx[0])
+    p1_rel = int(valid_idx[min(3, len(valid_idx) - 1)])
+
+    x0 = float(seg_bx[p0_rel])
+    y0 = float(seg_by[p0_rel])
+    x1 = float(seg_bx[p1_rel])
+    y1 = float(seg_by[p1_rel])
+
+    dx_forward = float(target_sign * (x1 - x0))
+    dy = float(y1 - y0)  # image y increases downward
+
+    if dx_forward <= 1e-6:
+        return CriterionDebug(
+            passed=False,
+            metrics={
+                "x0": x0,
+                "y0": y0,
+                "x1": x1,
+                "y1": y1,
+                "dx_forward": dx_forward,
+                "dy": dy,
+                "launch_angle_deg": float("nan"),
+            },
+            thresholds={
+                "THROW_HIGHER_ANGLE_THR_DEG": 0.0,
+            },
+            notes=["ball_not_moving_forward_after_release"],
+            valid_frames=int(m.sum()),
+        )
+
+    # Positive angle means the ball initially travels upward/forward.
+    # Negative angle means the ball is going downward too early.
+    launch_angle_deg = float(np.degrees(np.arctan2(-dy, dx_forward)))
+
+    THROW_HIGHER_ANGLE_THR_DEG = 0.0
+    passed = (launch_angle_deg > THROW_HIGHER_ANGLE_THR_DEG)
+
+    return CriterionDebug(
+        passed=bool(passed),
+        metrics={
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+            "dx_forward": dx_forward,
+            "dy": dy,
+            "launch_angle_deg": launch_angle_deg,
+        },
+        thresholds={
+            "THROW_HIGHER_ANGLE_THR_DEG": float(THROW_HIGHER_ANGLE_THR_DEG),
+        },
+        notes=[] if passed else ["throw_higher"],
+        valid_frames=int(m.sum()),
+    )
+
+def crit_throw_harder_details(
+    df: pd.DataFrame,
+    a: int,
+    b: int,
+) -> CriterionDebug:
+    """
+    Estimate post-release ball speed from the earliest valid ball points
+    inside a short tail window.
+
+    This function itself only computes the speed-related metrics.
+    The final pass/fail for student will be decided by comparing against model.
+    """
+    bx, by = load_xy(df, "ball")
+    scale = torso_scale(df)
+
+    a = max(0, int(a))
+    b = min(len(bx) - 1, int(b))
+    if b <= a:
+        return _fail(["invalid_window"], valid_frames=0)
+
+    seg_bx = bx[a:b+1]
+    seg_by = by[a:b+1]
+    seg_sc = scale[a:b+1]
+
+    m = np.isfinite(seg_bx) & np.isfinite(seg_by) & np.isfinite(seg_sc)
+    valid_idx = np.where(m)[0]
+
+    if len(valid_idx) < 3:
+        return _fail(["too_few_valid_ball_frames"], valid_frames=int(m.sum()))
+
+    # Use early valid points to approximate initial post-release speed
+    p0_rel = int(valid_idx[0])
+    p1_rel = int(valid_idx[min(3, len(valid_idx) - 1)])
+
+    x0 = float(seg_bx[p0_rel])
+    y0 = float(seg_by[p0_rel])
+    x1 = float(seg_bx[p1_rel])
+    y1 = float(seg_by[p1_rel])
+
+    dx = float(x1 - x0)
+    dy = float(y1 - y0)
+    dist_raw = float(np.sqrt(dx**2 + dy**2))
+
+    sc0 = float(seg_sc[p0_rel])
+    sc1 = float(seg_sc[p1_rel])
+    sc = float(np.nanmedian([sc0, sc1]))
+    if not np.isfinite(sc) or sc <= 1e-6:
+        sc = float(np.nanmedian(seg_sc[np.isfinite(seg_sc)]))
+        if not np.isfinite(sc) or sc <= 1e-6:
+            sc = 1.0
+
+    release_speed_norm = float(dist_raw / sc)
+
+    return CriterionDebug(
+        passed=True,  # temporary; final student pass/fail decided after comparing with model
+        metrics={
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+            "dx": dx,
+            "dy": dy,
+            "release_speed_raw": dist_raw,
+            "release_speed_norm": release_speed_norm,
+            "scale_median": float(sc),
+        },
+        thresholds={},
+        notes=[],
+        valid_frames=int(m.sum()),
+    )
+
+
+
 # =============================================================================
 # 主入口：给 main.py 调用
 # =============================================================================
@@ -659,7 +820,123 @@ def evaluate_criteria(
         "student": pack(stu_dbg),
         "model": pack(mdl_dbg),
     })
+    
+    
+    # ---- extra signal: throw_higher
+    # Do NOT put this into items yet, otherwise current frontend will render it.
+    THROW_HIGHER_TAIL_FRAMES = 12
 
+    stu_throw_higher_range = None
+    mdl_throw_higher_range = None
+
+    stu_throw_higher_dbg = _fail(["missing_student_meta"], valid_frames=0)
+    mdl_throw_higher_dbg = _fail(["missing_model_meta"], valid_frames=0)
+
+    if total_stu_frames > 0:
+        stu_throw_higher_range = (
+            max(0, total_stu_frames - THROW_HIGHER_TAIL_FRAMES),
+            total_stu_frames - 1,
+        )
+    if len(mdl_df) > 0:
+        mdl_throw_higher_range = (
+            max(0, len(mdl_df) - THROW_HIGHER_TAIL_FRAMES),
+            len(mdl_df) - 1,
+        )
+
+    if stu_throw_higher_range is not None and stu_target_sign is not None:
+        stu_throw_higher_dbg = crit_throw_higher_details(
+            stu_df,
+            stu_throw_higher_range[0],
+            stu_throw_higher_range[1],
+            target_sign=stu_target_sign,
+        )
+
+    if mdl_throw_higher_range is not None and mdl_target_sign is not None:
+        mdl_throw_higher_dbg = crit_throw_higher_details(
+            mdl_df,
+            mdl_throw_higher_range[0],
+            mdl_throw_higher_range[1],
+            target_sign=mdl_target_sign,
+        )
+
+
+    # ---- extra signal: throw_harder
+    # Do NOT put this into items yet, otherwise current frontend will render it.
+    THROW_HARDER_TAIL_FRAMES = 12
+    HARDER_RATIO_THR = 0.5
+
+    stu_throw_harder_range = None
+    mdl_throw_harder_range = None
+
+    stu_throw_harder_dbg = _fail(["missing_student_meta"], valid_frames=0)
+    mdl_throw_harder_dbg = _fail(["missing_model_meta"], valid_frames=0)
+
+    if total_stu_frames > 0:
+        stu_throw_harder_range = (
+            max(0, total_stu_frames - THROW_HARDER_TAIL_FRAMES),
+            total_stu_frames - 1,
+        )
+    if len(mdl_df) > 0:
+        mdl_throw_harder_range = (
+            max(0, len(mdl_df) - THROW_HARDER_TAIL_FRAMES),
+            len(mdl_df) - 1,
+        )
+
+    if stu_throw_harder_range is not None:
+        stu_throw_harder_dbg = crit_throw_harder_details(
+            stu_df,
+            stu_throw_harder_range[0],
+            stu_throw_harder_range[1],
+        )
+
+    if mdl_throw_harder_range is not None:
+        mdl_throw_harder_dbg = crit_throw_harder_details(
+            mdl_df,
+            mdl_throw_harder_range[0],
+            mdl_throw_harder_range[1],
+        )
+
+    # Final pass/fail is based on student speed relative to model speed
+    stu_speed_norm = float(stu_throw_harder_dbg.metrics.get("release_speed_norm", np.nan)) \
+        if isinstance(stu_throw_harder_dbg.metrics, dict) else np.nan
+    mdl_speed_norm = float(mdl_throw_harder_dbg.metrics.get("release_speed_norm", np.nan)) \
+        if isinstance(mdl_throw_harder_dbg.metrics, dict) else np.nan
+
+    if np.isfinite(stu_speed_norm) and np.isfinite(mdl_speed_norm) and mdl_speed_norm > 1e-6:
+        speed_ratio = float(stu_speed_norm / mdl_speed_norm)
+        passed = bool(speed_ratio >= HARDER_RATIO_THR)
+
+        stu_throw_harder_dbg.passed = passed
+        stu_throw_harder_dbg.thresholds = {
+            "HARDER_RATIO_THR": float(HARDER_RATIO_THR),
+            "MODEL_RELEASE_SPEED_NORM": float(mdl_speed_norm),
+        }
+        stu_throw_harder_dbg.metrics["speed_ratio_vs_model"] = speed_ratio
+        stu_throw_harder_dbg.notes = [] if passed else ["throw_harder"]
+
+        # model side is just reference, always mark pass if valid
+        mdl_throw_harder_dbg.passed = True
+        mdl_throw_harder_dbg.thresholds = {
+            "HARDER_RATIO_THR": float(HARDER_RATIO_THR),
+        }
+        mdl_throw_harder_dbg.notes = []
+    else:
+        if isinstance(stu_throw_harder_dbg.metrics, dict):
+            stu_throw_harder_dbg.metrics["speed_ratio_vs_model"] = float("nan")
+        stu_throw_harder_dbg.passed = False
+        stu_throw_harder_dbg.thresholds = {
+            "HARDER_RATIO_THR": float(HARDER_RATIO_THR),
+            "MODEL_RELEASE_SPEED_NORM": float(mdl_speed_norm) if np.isfinite(mdl_speed_norm) else float("nan"),
+        }
+        stu_throw_harder_dbg.notes = ["throw_harder_reference_unavailable"]
+
+        if isinstance(mdl_throw_harder_dbg.thresholds, dict):
+            mdl_throw_harder_dbg.thresholds = {
+                "HARDER_RATIO_THR": float(HARDER_RATIO_THR),
+            }
+            
+            
+            
     return {
         "meta": {
             "student": {
@@ -678,4 +955,20 @@ def evaluate_criteria(
             },
         },
         "items": items,
+        "extra_feedback_signals": {
+            "throw_higher": {
+                "name": "Throw higher",
+                "student_range": [int(stu_throw_higher_range[0]), int(stu_throw_higher_range[1])] if stu_throw_higher_range else None,
+                "model_range": [int(mdl_throw_higher_range[0]), int(mdl_throw_higher_range[1])] if mdl_throw_higher_range else None,
+                "student": pack(stu_throw_higher_dbg),
+                "model": pack(mdl_throw_higher_dbg),
+            },
+            "throw_harder": {
+                "name": "Throw harder",
+                "student_range": [int(stu_throw_harder_range[0]), int(stu_throw_harder_range[1])] if stu_throw_harder_range else None,
+                "model_range": [int(mdl_throw_harder_range[0]), int(mdl_throw_harder_range[1])] if mdl_throw_harder_range else None,
+                "student": pack(stu_throw_harder_dbg),
+                "model": pack(mdl_throw_harder_dbg),
+            }
+        },
     }

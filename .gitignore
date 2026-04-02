@@ -50,3 +50,5 @@ venv/
 
 *.json
 *.png
+cloudflared.exe
+config.yml

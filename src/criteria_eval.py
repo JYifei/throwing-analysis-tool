@@ -272,54 +272,82 @@ def crit3_step_forward_with_nonthrow_foot_details(
     target_sign: int,
     nonthrow_side: str,
 ) -> CriterionDebug:
+    # Non-throwing foot = the foot that should step forward
     if nonthrow_side == "left":
-        foot_x, _ = load_xy(df, "left_ankle")
+        good_foot_x, _ = load_xy(df, "left_ankle")
+        wrong_foot_x, _ = load_xy(df, "right_ankle")
     else:
-        foot_x, _ = load_xy(df, "right_ankle")
+        good_foot_x, _ = load_xy(df, "right_ankle")
+        wrong_foot_x, _ = load_xy(df, "left_ankle")
 
     scale = torso_scale(df)
 
     a = max(0, int(a))
-    b = min(len(foot_x) - 1, int(b))
+    b = min(len(good_foot_x) - 1, int(b))
     if b <= a:
         return _fail(["invalid_window"], valid_frames=0)
 
-    seg_x = foot_x[a:b+1]
+    seg_good_x = good_foot_x[a:b+1]
+    seg_wrong_x = wrong_foot_x[a:b+1]
     seg_sc = scale[a:b+1]
 
-    m = np.isfinite(seg_x) & np.isfinite(seg_sc)
-    valid_x = seg_x[m]
+    m_good = np.isfinite(seg_good_x) & np.isfinite(seg_sc)
+    m_wrong = np.isfinite(seg_wrong_x) & np.isfinite(seg_sc)
 
-    if len(valid_x) < 3:
-        return _fail(["too_few_valid_frames"], valid_frames=int(m.sum()))
+    valid_good_x = seg_good_x[m_good]
+    valid_wrong_x = seg_wrong_x[m_wrong]
+
+    if len(valid_good_x) < 3:
+        return _fail(["too_few_valid_frames"], valid_frames=int(m_good.sum()))
 
     # First 20% of the window as the reference
-    k = max(2, int(len(valid_x) * 0.2))
-    x0 = float(np.mean(valid_x[:k]))
+    k_good = max(2, int(len(valid_good_x) * 0.2))
+    x0_good = float(np.mean(valid_good_x[:k_good]))
 
-    # Use the same peak-based displacement logic, but only in x
     if target_sign == 1:
-        peak_x = float(np.max(valid_x))
-        disp_x = peak_x - x0
+        peak_good_x = float(np.max(valid_good_x))
+        disp_good_x = peak_good_x - x0_good
     else:
-        peak_x = float(np.min(valid_x))
-        disp_x = x0 - peak_x
+        peak_good_x = float(np.min(valid_good_x))
+        disp_good_x = x0_good - peak_good_x
 
-    sc = float(np.nanmedian(seg_sc[m]))
+    sc = float(np.nanmedian(seg_sc[m_good]))
     if not np.isfinite(sc) or sc <= 1e-6:
         sc = 1.0
 
-    disp_x_norm = float(disp_x / sc)
+    disp_good_x_norm = float(disp_good_x / sc)
 
-    # Two-level feedback thresholds (both normalized)
+    # Also measure the throwing-side foot, to detect wrong-foot stepping
+    disp_wrong_x_norm = 0.0
+    if len(valid_wrong_x) >= 3:
+        k_wrong = max(2, int(len(valid_wrong_x) * 0.2))
+        x0_wrong = float(np.mean(valid_wrong_x[:k_wrong]))
+
+        if target_sign == 1:
+            peak_wrong_x = float(np.max(valid_wrong_x))
+            disp_wrong_x = peak_wrong_x - x0_wrong
+        else:
+            peak_wrong_x = float(np.min(valid_wrong_x))
+            disp_wrong_x = x0_wrong - peak_wrong_x
+
+        disp_wrong_x_norm = float(disp_wrong_x / sc)
+
+    # Thresholds
     STEP_X_TINY_THR = 0.1
     STEP_X_THR = 1.0
 
-    passed = (disp_x_norm >= STEP_X_THR)
+    # Wrong-foot heuristic:
+    # if the correct foot does not pass, but the wrong foot moves clearly forward,
+    # treat it as stepping with the wrong foot.
+    WRONG_FOOT_CLEAR_THR = STEP_X_THR
+
+    passed = (disp_good_x_norm >= STEP_X_THR)
 
     notes = []
     if not passed:
-        if disp_x_norm < STEP_X_TINY_THR:
+        if disp_wrong_x_norm >= WRONG_FOOT_CLEAR_THR and disp_wrong_x_norm > disp_good_x_norm:
+            notes.append("step_with_wrong_foot")
+        elif disp_good_x_norm < STEP_X_TINY_THR:
             notes.append("take_a_step_forward")
         else:
             notes.append("take_a_bigger_step")
@@ -327,19 +355,20 @@ def crit3_step_forward_with_nonthrow_foot_details(
     return CriterionDebug(
         passed=bool(passed),
         metrics={
-            "disp_x_norm": disp_x_norm,
-            "disp_x_raw": float(disp_x),
+            "disp_x_norm": disp_good_x_norm,
+            "disp_x_raw": float(disp_good_x),
+            "wrong_foot_disp_x_norm": float(disp_wrong_x_norm),
             "scale_median": float(sc),
             "target_sign": float(target_sign),
         },
         thresholds={
             "STEP_X_TINY_THR": STEP_X_TINY_THR,
             "STEP_X_THR": STEP_X_THR,
+            "WRONG_FOOT_CLEAR_THR": WRONG_FOOT_CLEAR_THR,
         },
         notes=notes,
-        valid_frames=int(m.sum()),
+        valid_frames=int(m_good.sum()),
     )
-
 
 def crit4_hand_across_body_towards_opposite_hip_details(
     df: pd.DataFrame,
@@ -727,9 +756,10 @@ def evaluate_criteria(
     if mdl_throwing_side is not None:
         mdl_dbg = crit1_windup_downward_hand_arm_details(mdl_df, a, b, mdl_throwing_side)
 
+    # ---- c1
     items.append({
         "key": "c1",
-        "name": "Windup initiated with downward movement of hand and arm",
+        "name": "Bring the throwing arm back, up and over the shoulder (L-shape)",
         "model_range": [int(a), int(b)],
         "student_range": [int(sr[0]), int(sr[1])] if sr else None,
         "student": pack(stu_dbg),
@@ -752,14 +782,16 @@ def evaluate_criteria(
             mdl_df, a, b, target_sign=mdl_target_sign, nonthrow_side=mdl_nonthrow_side
         )
 
+    # ---- c2
     items.append({
         "key": "c2",
-        "name": "Rotate hip & shoulder so non-throwing side faces target",
+        "name": "Open the shoulder",
         "model_range": [int(a), int(b)],
         "student_range": [int(sr[0]), int(sr[1])] if sr else None,
         "student": pack(stu_dbg),
         "model": pack(mdl_dbg),
     })
+
 
     # ---- c3
     a, b = model_windows["c3"]
@@ -777,9 +809,10 @@ def evaluate_criteria(
             mdl_df, a, b, target_sign=mdl_target_sign, nonthrow_side=mdl_nonthrow_side
         )
 
+    # ---- c3
     items.append({
         "key": "c3",
-        "name": "Step forward with non-throwing foot",
+        "name": "Step forward with the opposite foot",
         "model_range": [int(a), int(b)],
         "student_range": [int(sr[0]), int(sr[1])] if sr else None,
         "student": pack(stu_dbg),
@@ -814,7 +847,7 @@ def evaluate_criteria(
 
     items.append({
         "key": "c4",
-        "name": "Throwing hand reaches across body towards opposite hip",
+        "name": "Follow through",
         "model_range": [int(a), int(b)],
         "student_range": [int(sr[0]), int(sr[1])] if sr else None,
         "student": pack(stu_dbg),

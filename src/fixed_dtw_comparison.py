@@ -22,6 +22,7 @@ import pandas as pd
 from fastdtw import fastdtw
 from typing import Dict, Tuple, List, Optional
 import warnings
+import math
 
 warnings.filterwarnings("ignore")
 
@@ -68,6 +69,33 @@ class FixedMotionDTW:
         ("left",  "knee"),     ("right", "knee"),
         ("left",  "ankle"),    ("right", "ankle"),
     ]
+    
+    OPPOSITE_ANKLE_DTW_FACTOR = math.sqrt(2.0)
+    # 说明：
+    # 因为 _pose_dist_l2 用的是 Euclidean norm:
+    #   ||a-b|| = sqrt(sum_i d_i^2)
+    # 如果你想让某一组维度的“权重翻倍”，数学上应该乘 sqrt(2)，
+    # 这样该组维度对距离的平方贡献会变成原来的 2 倍。
+    # 如果你直接乘 2.0，那么贡献会变成 4 倍，不是严格意义上的“翻倍”。
+
+    def _pose_joint_flat_slice(self, side: str, joint: str) -> slice:
+        idx = self.POSE_JOINTS.index((side, joint))
+        return slice(2 * idx, 2 * idx + 2)
+
+    def _apply_pose_joint_weight(
+        self,
+        pose_mat: np.ndarray,
+        *,
+        side: str,
+        joint: str,
+        factor: float,
+    ) -> np.ndarray:
+        if pose_mat is None or pose_mat.size == 0:
+            return pose_mat
+        out = np.array(pose_mat, dtype=float, copy=True)
+        sl = self._pose_joint_flat_slice(side, joint)
+        out[:, sl] *= float(factor)
+        return out
 
     def _angle_distance_norm(self, x, y) -> float:
         """
@@ -747,6 +775,22 @@ class FixedMotionDTW:
 
         ref_pose = self._build_pose_matrix(self.reference_df, flip_x=flip_ref_pose)
         stu_pose = self._build_pose_matrix(student_df, flip_x=False)
+
+        opp_side = "left" if dom == "right" else "right"
+
+        ref_pose = self._apply_pose_joint_weight(
+            ref_pose,
+            side=opp_side,
+            joint="ankle",
+            factor=self.OPPOSITE_ANKLE_DTW_FACTOR,
+        )
+
+        stu_pose = self._apply_pose_joint_weight(
+            stu_pose,
+            side=opp_side,
+            joint="ankle",
+            factor=self.OPPOSITE_ANKLE_DTW_FACTOR,
+        )
 
         pose_dtw_norm, pose_path = self._compute_pose_dtw_path(ref_pose, stu_pose)
         map_s_to_m = self._path_to_map_s_to_m(pose_path, n_student=len(student_df))

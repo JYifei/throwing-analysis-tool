@@ -280,19 +280,36 @@
 
 
     function feedbackTextForItem(it) {
-      const key = (it && it.key) ? String(it.key) : "";
-      const notes = (it && it.student && Array.isArray(it.student.notes)) ? it.student.notes : [];
+    const key = (it && it.key) ? String(it.key) : "";
+    const notes = (it && it.student && Array.isArray(it.student.notes)) ? it.student.notes : [];
 
-      if (key === "c1") return "Move hand downwards during windup";
-      if (key === "c2") return "Rotate body sideway during windup";
-      if (key === "c3") {
-        if (notes.includes("take_a_bigger_step")) return "Take a bigger step";
-        if (notes.includes("take_a_step_forward")) return "Take a step forward";
-        return "Take a bigger step";
-      }
-      if (key === "c4") return "Follow-through";
-      return null;
+    if (key === "c1") {
+      return "Bring the throwing arm back to form an L-shape";
     }
+
+    if (key === "c2") {
+      return "Open the shoulder so that the non-throwing side is facing the target";
+    }
+
+    if (key === "c3") {
+      if (notes.includes("step_with_wrong_foot")) {
+        return "Step forward with the opposite foot";
+      }
+      if (notes.includes("take_a_bigger_step")) {
+        return "Take a bigger step forward with the opposite foot";
+      }
+      if (notes.includes("take_a_step_forward")) {
+        return "Step forward with the opposite foot";
+      }
+      return "Step forward with the opposite foot";
+    }
+
+    if (key === "c4") {
+      return "Follow through across your body";
+    }
+
+    return null;
+  }
 
     function feedbackTextForExtraSignal(key) {
       if (key === "throw_higher") return "Throw higher";

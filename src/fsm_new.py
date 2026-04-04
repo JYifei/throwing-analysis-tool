@@ -1177,7 +1177,11 @@ def run_single_throw_dtw(
 )
 
     features_out = {}
-    for k in comparator.FEATURE_NAMES:
+    feature_keys = list(comparator.FEATURE_NAMES)
+    if "pose_xy" in scores:
+        feature_keys.append("pose_xy")
+
+    for k in feature_keys:
         if k not in scores:
             continue
 

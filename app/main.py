@@ -273,34 +273,26 @@ def create_job(
                 )
 
 
-                # ---------- 9) score.json (mean_err -> matching_percent) ----------
+                # ---------- 9) score.json ----------
+                # Do NOT recompute score here.
+                # Reuse DTW score already written by run_single_throw_dtw() in fsm_new.py.
                 score_path = throw_dir / "score.json"
 
-                # --- 【同步修改】基于解剖学(躯干长度)进行动态缩放 ---
-                stu_torso = _get_median_torso_length(str(crop_csv))
-                mdl_torso = _get_median_torso_length(str(model_crop_csv))
-                
-                if stu_torso is not None and mdl_torso is not None:
-                    dynamic_scale = stu_torso / mdl_torso
+                if score_path.exists():
+                    score_obj = json.loads(score_path.read_text(encoding="utf-8"))
+                    dtw_obj = score_obj.get("dtw", {}) if isinstance(score_obj, dict) else {}
+                    dtw_overall = dtw_obj.get("overall_matching_score", None)
+
+                    # Build top-level UI score from DTW overall, but keep original dtw payload
+                    if dtw_overall is not None:
+                        ui_score_obj = build_score_obj(float(dtw_overall), **SCORE_PARAMS)
+                        ui_score_obj["dtw"] = dtw_obj
+                        score_path.write_text(
+                            json.dumps(ui_score_obj, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
                 else:
-                    dynamic_scale = hs / max(hm, 1)
-                # ---------------------------------------------------
-
-                mean_err = compute_mean_normalized_error(
-                    map_s_to_m=read_map_csv(str(map_csv)),
-                    stu_xy=_load_xy_pairs_cached(str(crop_csv)),
-                    mdl_xy=_load_xy_pairs_cached(str(model_crop_csv)),
-                    ws=ws,
-                    out_h=hs,
-                    wm=wm,
-                    model_scale=dynamic_scale,  # <== 使用人体物理比例缩放
-                    flip_model=flip_needed,
-                    joints=[j for j in MAIN_JOINTS],
-                )
-
-                score_obj = build_score_obj(mean_err, **SCORE_PARAMS)
-                score_path.write_text(json.dumps(score_obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
+                    print(f"[WARN] score.json missing before UI postprocess: {score_path}")
 
                 # ---------- 9) Update manifest entry ----------
                 for tt in manifest_obj.get("throws", []) or []:

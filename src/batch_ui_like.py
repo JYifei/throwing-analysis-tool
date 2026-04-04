@@ -1,4 +1,3 @@
-# batch_ui_like.py
 from __future__ import annotations
 
 import os
@@ -6,15 +5,13 @@ import json
 import shutil
 import traceback
 from pathlib import Path
-from uuid import uuid4
-from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 import cv2
 import pandas as pd
 import numpy as np
 
-# ---- import exactly like your FastAPI main.py ----
+# ---- keep imports as-is because this file is inside src/ ----
 from fsm_new import ensure_browser_mp4, run_once
 from render_side_by_side import (
     global_bbox_from_csv,
@@ -28,7 +25,12 @@ from render_side_by_side import (
     _load_xy_pairs_cached,
 )
 from criteria_eval import evaluate_criteria
-
+from result_logic import (
+    build_score_obj,
+    load_score_params_from_env,
+    score_message,
+    collect_ui_like_feedback,
+)
 
 # -------------------------
 # Defaults (same as app)
@@ -38,7 +40,10 @@ RUNS_ROOT = Path(os.environ.get("THROWING_RUNS_ROOT", "runs")).resolve()
 DEFAULT_REFERENCE_CSV = Path(os.environ.get("THROWING_REFERENCE_CSV", "reference/model.csv")).resolve()
 DEFAULT_THRESHOLDS_JSON = Path(os.environ.get("THROWING_THRESHOLDS_JSON", "config/dtw_thresholds.json")).resolve()
 
+DEFAULT_SCORE_PARAMS = load_score_params_from_env()
+
 INPUT_VIDEO_NAME = "input.mp4"
+
 
 def _get_median_torso_length(csv_path: str) -> Optional[float]:
     """
@@ -46,28 +51,27 @@ def _get_median_torso_length(csv_path: str) -> Optional[float]:
     """
     try:
         df = pd.read_csv(csv_path)
-        # 获取左右肩、左右髋
-        lsx = pd.to_numeric(df['left_shoulder_x'], errors='coerce')
-        lsy = pd.to_numeric(df['left_shoulder_y'], errors='coerce')
-        rsx = pd.to_numeric(df['right_shoulder_x'], errors='coerce')
-        rsy = pd.to_numeric(df['right_shoulder_y'], errors='coerce')
-        
-        lhx = pd.to_numeric(df['left_hip_x'], errors='coerce')
-        lhy = pd.to_numeric(df['left_hip_y'], errors='coerce')
-        rhx = pd.to_numeric(df['right_hip_x'], errors='coerce')
-        rhy = pd.to_numeric(df['right_hip_y'], errors='coerce')
-        
-        # 算中心点
+
+        lsx = pd.to_numeric(df["left_shoulder_x"], errors="coerce")
+        lsy = pd.to_numeric(df["left_shoulder_y"], errors="coerce")
+        rsx = pd.to_numeric(df["right_shoulder_x"], errors="coerce")
+        rsy = pd.to_numeric(df["right_shoulder_y"], errors="coerce")
+
+        lhx = pd.to_numeric(df["left_hip_x"], errors="coerce")
+        lhy = pd.to_numeric(df["left_hip_y"], errors="coerce")
+        rhx = pd.to_numeric(df["right_hip_x"], errors="coerce")
+        rhy = pd.to_numeric(df["right_hip_y"], errors="coerce")
+
         msx, msy = (lsx + rsx) / 2.0, (lsy + rsy) / 2.0
         mhx, mhy = (lhx + rhx) / 2.0, (lhy + rhy) / 2.0
-        
-        # 算欧式距离
-        dist = np.sqrt((msx - mhx)**2 + (msy - mhy)**2)
+
+        dist = np.sqrt((msx - mhx) ** 2 + (msy - mhy) ** 2)
         median_dist = float(np.nanmedian(dist))
-        
+
         return median_dist if np.isfinite(median_dist) and median_dist > 0 else None
     except Exception:
         return None
+
 
 def _read_facing(csv_path: str) -> Optional[str]:
     try:
@@ -94,7 +98,6 @@ def _new_job_dir_from_stem(runs_root: Path, stem: str) -> Path:
         (base / "outputs").mkdir(parents=True, exist_ok=True)
         return base
 
-    # auto-increment if already exists
     idx = 1
     while True:
         candidate = runs_root / f"{stem}_{idx}"
@@ -132,10 +135,14 @@ def _ui_like_postprocess_one_job(
     thresholds_json: Path,
     green_yellow: float = 0.25,
     yellow_red: float = 0.50,
+    score_params: Optional[Dict[str, float]] = None,
 ) -> None:
     """
     This is a direct adaptation of your FastAPI create_job() post-processing.
     """
+    if score_params is None:
+        score_params = dict(DEFAULT_SCORE_PARAMS)
+
     manifest_path = job_dir / "outputs" / "manifest.json"
     if not manifest_path.exists():
         raise RuntimeError("manifest.json missing")
@@ -201,7 +208,11 @@ def _ui_like_postprocess_one_job(
         # ---------- 6) Auto flip ----------
         stu_facing = _read_facing(str(stu_csv))
         ref_facing = _read_facing(str(reference_csv))
-        flip_needed = (stu_facing is not None and ref_facing is not None and stu_facing != ref_facing)
+        flip_needed = (
+            stu_facing is not None
+            and ref_facing is not None
+            and stu_facing != ref_facing
+        )
 
         # ---------- 7) Render compare.mp4 ----------
         out_name = "compare.mp4"
@@ -228,23 +239,22 @@ def _ui_like_postprocess_one_job(
             map_csv=str(map_csv),
             model_windows=None,
         )
-        criteria_path.write_text(json.dumps(criteria_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        criteria_path.write_text(
+            json.dumps(criteria_obj, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-        # ---------- 9) score.json (mean_err -> matching_percent) ----------
-        # ---------- 9) score.json (mean_err -> matching_percent) ----------
+        # ---------- 9) score.json ----------
         score_path = throw_dir / "score.json"
 
-        # --- 【核心修改】基于解剖学(躯干长度)进行动态缩放 ---
+        # --- 基于躯干长度进行动态缩放 ---
         stu_torso = _get_median_torso_length(str(crop_csv))
         mdl_torso = _get_median_torso_length(str(model_crop_csv))
-        
-        if stu_torso is not None and mdl_torso is not None:
-            # 用真实身体比例进行缩放
+
+        if stu_torso is not None and mdl_torso is not None and mdl_torso > 1e-6:
             dynamic_scale = stu_torso / mdl_torso
         else:
-            # 如果没测出躯干(极少见)，降级退回使用画面高度缩放
             dynamic_scale = hs / max(hm, 1)
-        # ---------------------------------------------------
 
         mean_err = compute_mean_normalized_error(
             map_s_to_m=read_map_csv(str(map_csv)),
@@ -253,32 +263,16 @@ def _ui_like_postprocess_one_job(
             ws=ws,
             out_h=hs,
             wm=wm,
-            model_scale=dynamic_scale,  # <== 这里传入我们算出的真实身体比例
+            model_scale=dynamic_scale,
             flip_model=flip_needed,
             joints=[j for j in MAIN_JOINTS],
         )
 
-        k = 0.20
-        l = 1.80
-        if not np.isfinite(mean_err):
-            matching = 0.0
-        elif mean_err <= k:
-            matching = 100.0
-        elif mean_err >= l:
-            matching = 0.0
-        else:
-            matching = 100.0 * (l - mean_err) / (l - k)
-
-        score_obj = {
-            "matching_percent": round(float(matching), 1),
-            "mean_normalized_error": round(float(mean_err), 4),
-            "mapping": {
-                "k_full_score": k,
-                "l_zero_score": l,
-                "rule": "e<=k ->100; k<e<l -> linear; e>=l ->0",
-            },
-        }
-        score_path.write_text(json.dumps(score_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        score_obj = build_score_obj(mean_err, **score_params)
+        score_path.write_text(
+            json.dumps(score_obj, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         # ---------- 10) Update manifest entry ----------
         for tt in manifest_obj.get("throws", []) or []:
@@ -289,11 +283,12 @@ def _ui_like_postprocess_one_job(
                 tt["score"] = f"/runs/{job_id}/throws/{throw_id}/score.json"
                 break
 
-    manifest_path.write_text(json.dumps(manifest_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest_obj, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
-# =====================================================================
-# 新增模块：自动遍历 Runs 文件夹并提取 Criteria + Score 结果生成 CSV
-# =====================================================================
+
 def summarize_all_runs(runs_root: Path, output_csv: str = "batch_summary_report.csv") -> None:
     if not runs_root.exists():
         print(f"[WARN] 找不到运行记录文件夹: {runs_root}")
@@ -301,81 +296,77 @@ def summarize_all_runs(runs_root: Path, output_csv: str = "batch_summary_report.
 
     summary_data = []
 
-    # 遍历 runs_root 下的所有文件夹 (不论是 T1, 还是 时间戳)
     for run_dir in runs_root.iterdir():
         if not run_dir.is_dir():
             continue
-        
+
         run_name = run_dir.name
         throws_dir = run_dir / "throws"
-        
+
         if not throws_dir.exists():
             continue
-            
-        # 遍历每个 throw_xxx 文件夹
+
         for throw_dir in throws_dir.iterdir():
             if not throw_dir.is_dir() or not throw_dir.name.startswith("throw_"):
                 continue
-                
+
             throw_id = throw_dir.name
-            
-            # 初始化这一行的数据
             row = {"Run": run_name, "Throw": throw_id}
 
-            # --- 1) 读取评分 (Score) 和 原始误差 (Mean Error) ---
-            # score.json 存放了 matching_percent 和 mean_normalized_error
+            # --- 1) 读取 score.json ---
             score_path = throw_dir / "score.json"
             score_val = ""
             err_val = ""
+            score_float = 0.0
+
             if score_path.exists():
                 try:
                     with open(score_path, "r", encoding="utf-8") as f:
                         s_data = json.load(f)
-                        
-                        # 获取 matching_percent (即 0-100 的得分)
-                        val = s_data.get("matching_percent")
-                        if val is not None:
-                            score_val = str(val)
-                            
-                        # 获取最原始的 DTW 误差 (Mean Normalized Error)
-                        err = s_data.get("mean_normalized_error")
-                        if err is not None:
-                            err_val = str(err)
-                            
+
+                    val = s_data.get("matching_percent")
+                    if val is not None:
+                        score_val = str(val)
+                        score_float = float(val)
+
+                    err = s_data.get("mean_normalized_error")
+                    if err is not None:
+                        err_val = str(err)
                 except Exception:
                     pass
-                    
+
             row["Score"] = score_val
             row["Mean_Error"] = err_val
+            row["Score_Message"] = score_message(score_float)
 
-            # --- 2) 读取 Criteria ---
-            # 兼容多种命名，优先读取 criteria.json
-            json_files_to_check = ["criteria.json", "eval.json"]
+            # --- 2) 读取 criteria.json ---
+            criteria_path = throw_dir / "criteria.json"
+            criteria_obj = None
             criteria_data = None
-            
-            for jf in json_files_to_check:
-                jf_path = throw_dir / jf
-                if jf_path.exists():
-                    try:
-                        with open(jf_path, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                            if "items" in data:
-                                criteria_data = data["items"]
-                                break
-                            elif "criteria" in data:
-                                criteria_data = data["criteria"]
-                                break
-                            elif isinstance(data, list) and len(data) > 0 and "key" in data[0]:
-                                criteria_data = data
-                                break
-                    except Exception:
-                        pass
-            
-            # 如果没找到 criteria 数据，填空
+
+            if criteria_path.exists():
+                try:
+                    with open(criteria_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+
+                    if isinstance(data, dict) and "items" in data:
+                        criteria_obj = data
+                        criteria_data = data["items"]
+                    elif isinstance(data, dict) and "criteria" in data:
+                        criteria_data = data["criteria"]
+                        criteria_obj = {"items": criteria_data}
+                    elif isinstance(data, list) and len(data) > 0 and "key" in data[0]:
+                        criteria_data = data
+                        criteria_obj = {"items": criteria_data}
+                except Exception:
+                    pass
+
             if not criteria_data:
                 for c in ["C1", "C2", "C3", "C4"]:
                     row[f"{c}_Pass"] = "-"
                     row[f"{c}_Reason"] = "No Data"
+                row["Feedback_1"] = ""
+                row["Feedback_2"] = ""
                 summary_data.append(row)
                 continue
 
@@ -383,42 +374,46 @@ def summarize_all_runs(runs_root: Path, output_csv: str = "batch_summary_report.
                 key = item.get("key")
                 if not key:
                     continue
-                
-                student_result = item.get("student", {})
-                passed = student_result.get("passed", False)
-                notes = student_result.get("notes", [])
-                
+
+                student_result = item.get("student", {}) or {}
+                passed = bool(student_result.get("passed", False))
+                notes = student_result.get("notes", []) or []
+
                 row[f"{key.upper()}_Pass"] = "Y" if passed else "N"
                 row[f"{key.upper()}_Reason"] = "" if passed else "; ".join(notes)
-            
+
+            # --- 3) 生成 UI-like feedback ---
+            ui_feedbacks = collect_ui_like_feedback(criteria_obj, score_float)
+            row["Feedback_1"] = ui_feedbacks[0] if len(ui_feedbacks) >= 1 else ""
+            row["Feedback_2"] = ui_feedbacks[1] if len(ui_feedbacks) >= 2 else ""
+
             summary_data.append(row)
 
     if not summary_data:
         print("[INFO] 没有找到可用于总结的数据。")
         return
-        
+
     df = pd.DataFrame(summary_data)
-    
-    # 动态排版列顺序: Run, Throw, Score, Mean_Error, C1..., C2...
-    cols = ["Run", "Throw", "Score", "Mean_Error"]
+
+    cols = ["Run", "Throw", "Score", "Mean_Error", "Score_Message", "Feedback_1", "Feedback_2"]
     for c in ["C1", "C2", "C3", "C4"]:
-        if f"{c}_Pass" in df.columns: cols.append(f"{c}_Pass")
-        if f"{c}_Reason" in df.columns: cols.append(f"{c}_Reason")
-    
+        if f"{c}_Pass" in df.columns:
+            cols.append(f"{c}_Pass")
+        if f"{c}_Reason" in df.columns:
+            cols.append(f"{c}_Reason")
+
     valid_cols = [c for c in cols if c in df.columns]
     df = df[valid_cols]
-    
-    # 按文件夹名字字典序排序
     df = df.sort_values(by=["Run", "Throw"])
-    
+
     out_path = Path(output_csv).resolve()
-    
-    # 增加文件占用容错
+
     try:
         df.to_csv(out_path, index=False, encoding="utf-8-sig")
-        print(f"\n[SUCCESS] 所有结果(含评分和真实误差)已汇总至: {out_path}")
+        print(f"\n[SUCCESS] 所有结果已汇总至: {out_path}")
     except PermissionError:
         print(f"\n[ERROR] 写入失败！文件 {out_path} 正被其他程序(如 Excel)打开，请关闭后重试。")
+
 
 def run_batch(
     video_dir: Path,
@@ -429,7 +424,11 @@ def run_batch(
     green_yellow: float = 0.25,
     yellow_red: float = 0.50,
     limit: Optional[int] = None,
+    score_params: Optional[Dict[str, float]] = None,
 ) -> None:
+    if score_params is None:
+        score_params = dict(DEFAULT_SCORE_PARAMS)
+
     runs_root.mkdir(parents=True, exist_ok=True)
 
     vids = _collect_videos(video_dir)
@@ -439,34 +438,32 @@ def run_batch(
     print(f"[INFO] video_dir={video_dir}")
     print(f"[INFO] found {len(vids)} videos")
     print(f"[INFO] runs_root={runs_root}")
+    print(f"[INFO] score_params={score_params}")
 
     for i, src_video in enumerate(vids, start=1):
         print("\n" + "=" * 80)
         print(f"[{i}/{len(vids)}] {src_video.name}")
 
-        stem = src_video.stem  # 文件名（不含扩展名）
+        stem = src_video.stem
         job_dir = _new_job_dir_from_stem(runs_root, stem)
         job_id = job_dir.name
 
         try:
             _write_job_status(job_dir, "running", extra={"source_video": str(src_video)})
 
-            # mimic server: copy upload -> inputs/input.mp4
             dst_video = job_dir / "inputs" / INPUT_VIDEO_NAME
             shutil.copy2(src_video, dst_video)
 
-            # 1) Main pipeline (same flags as server)
             result = run_once(
                 video_path=str(dst_video),
                 out_dir=str(job_dir),
                 reference_csv=str(reference_csv),
                 thresholds_json=str(thresholds_json),
-                enable_annotation=False,  # IMPORTANT (same as server)
-                enable_dtw=True,          # IMPORTANT (align map comes from here)
+                enable_annotation=False,
+                enable_dtw=True,
                 show_realtime=False,
             )
 
-            # 2) UI-like postprocess: compare + criteria + score + manifest rewrite
             _ui_like_postprocess_one_job(
                 job_dir=job_dir,
                 job_id=job_id,
@@ -474,19 +471,23 @@ def run_batch(
                 thresholds_json=thresholds_json,
                 green_yellow=green_yellow,
                 yellow_red=yellow_red,
+                score_params=score_params,
             )
 
             _write_job_status(job_dir, "done", extra={"result": result})
             print(f"[DONE] job_id={job_id}")
 
         except Exception as e:
-            _write_job_status(job_dir, "failed", extra={"error": str(e), "traceback": traceback.format_exc()})
+            _write_job_status(
+                job_dir,
+                "failed",
+                extra={"error": str(e), "traceback": traceback.format_exc()},
+            )
             print(f"[FAILED] job_id={job_id} err={e}")
 
     print("\n" + "=" * 80)
     print("[ALL DONE] 批处理完成，正在生成总结报告...")
-    
-    # 3) 批处理结束后，自动扫描 runs 文件夹，生成总结 CSV
+
     summarize_all_runs(runs_root, output_csv="batch_summary_report.csv")
 
 
@@ -501,6 +502,13 @@ if __name__ == "__main__":
     ap.add_argument("--green_yellow", type=float, default=0.25)
     ap.add_argument("--yellow_red", type=float, default=0.50)
     ap.add_argument("--limit", type=int, default=None)
+
+    ap.add_argument("--t1", type=float, default=DEFAULT_SCORE_PARAMS["t1"])
+    ap.add_argument("--t2", type=float, default=DEFAULT_SCORE_PARAMS["t2"])
+    ap.add_argument("--t3", type=float, default=DEFAULT_SCORE_PARAMS["t3"])
+    ap.add_argument("--s1", type=float, default=DEFAULT_SCORE_PARAMS["s1"])
+    ap.add_argument("--s2", type=float, default=DEFAULT_SCORE_PARAMS["s2"])
+
     args = ap.parse_args()
 
     run_batch(
@@ -511,4 +519,11 @@ if __name__ == "__main__":
         green_yellow=args.green_yellow,
         yellow_red=args.yellow_red,
         limit=args.limit,
+        score_params={
+            "t1": args.t1,
+            "t2": args.t2,
+            "t3": args.t3,
+            "s1": args.s1,
+            "s2": args.s2,
+        },
     )

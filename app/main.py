@@ -31,6 +31,7 @@ from src.render_side_by_side import (
     _load_xy_pairs_cached,
 )
 from src.criteria_eval import evaluate_criteria
+from src.result_logic import build_score_obj, load_score_params_from_env
 
 
 
@@ -43,6 +44,8 @@ RUNS_ROOT = Path(os.environ.get("THROWING_RUNS_ROOT", "runs")).resolve()
 # Defaults (you can later move these to config/env)
 DEFAULT_REFERENCE_CSV = Path(os.environ.get("THROWING_REFERENCE_CSV", "reference/model.csv")).resolve()
 DEFAULT_THRESHOLDS_JSON = Path(os.environ.get("THROWING_THRESHOLDS_JSON", "config/dtw_thresholds.json")).resolve()
+
+SCORE_PARAMS = load_score_params_from_env()
 
 # Where uploaded videos live inside each job folder
 INPUT_VIDEO_NAME = "input.mp4"
@@ -295,26 +298,7 @@ def create_job(
                     joints=[j for j in MAIN_JOINTS],
                 )
 
-                k = 0.10
-                l = 1.30
-                if not np.isfinite(mean_err):
-                    matching = 0.0
-                elif mean_err <= k:
-                    matching = 100.0
-                elif mean_err >= l:
-                    matching = 0.0
-                else:
-                    matching = 100.0 * (l - mean_err) / (l - k)
-
-                score_obj = {
-                    "matching_percent": round(float(matching), 1),
-                    "mean_normalized_error": round(float(mean_err), 4),
-                    "mapping": {
-                        "k_full_score": k,
-                        "l_zero_score": l,
-                        "rule": f"e<={k} ->100; {k}<e<{l} -> linear; e>={l} ->0",
-                    },
-                }
+                score_obj = build_score_obj(mean_err, **SCORE_PARAMS)
                 score_path.write_text(json.dumps(score_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

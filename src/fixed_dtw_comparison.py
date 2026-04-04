@@ -115,21 +115,36 @@ class FixedMotionDTW:
         stu_val = float(y[0])
         return min(abs(ref_val - stu_val) / self.ANGLE_MAX_DEG, 1.0)
 
+    def _swap_pose_lr_points(self, pts: np.ndarray) -> np.ndarray:
+        """
+        Swap left/right joint channels for one frame pose.
+        pts: (12, 2), order must follow POSE_JOINTS
+        """
+        out = pts.copy()
+
+        # POSE_JOINTS order is:
+        # 0 L_sh, 1 R_sh
+        # 2 L_hip, 3 R_hip
+        # 4 L_elb, 5 R_elb
+        # 6 L_wri, 7 R_wri
+        # 8 L_knee, 9 R_knee
+        # 10 L_ank, 11 R_ank
+        swap_pairs = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)]
+
+        for a, b in swap_pairs:
+            out[[a, b]] = out[[b, a]]
+
+        return out
+
     def __init__(self, reference_csv: str, reference_handedness: str = "auto"):
         self.reference_df = pd.read_csv(reference_csv)
         self.reference_facing = self._safe_mode(self.reference_df, "body_facing", default="unknown")
 
         # Decide reference dominant side
-        if reference_handedness in ("left", "right"):
-            self.reference_handedness = reference_handedness
-        else:
-            # AUTO: use body_facing if it is already 'left'/'right'
-            if self.reference_facing in ("left", "right"):
-                self.reference_handedness = self.reference_facing
-            else:
-                # fallback: heuristic
-                df_norm = self._normalize_coordinates(self.reference_df, self.reference_facing)
-                self.reference_handedness = self._infer_handedness(df_norm)
+        self.reference_handedness, self.reference_handedness_source = self._resolve_dominant_side(
+            self.reference_df,
+            manual=reference_handedness if reference_handedness in ("left", "right") else None,
+        )
 
         self.reference_features = self._extract_features(
             self.reference_df,
@@ -150,6 +165,50 @@ class FixedMotionDTW:
     def _has_series(df: pd.DataFrame, col: str) -> bool:
         return col in df.columns and df[col].notna().any()
 
+    def _resolve_dominant_side(
+        self,
+        df: pd.DataFrame,
+        manual: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """
+        Resolve dominant / throwing side.
+
+        Priority:
+        1) manual argument
+        2) explicit CSV columns such as throwing_side / dominant_side / handedness
+        3) heuristic inference
+
+        IMPORTANT:
+        body_facing is NOT used as dominant side.
+        """
+        def norm_side(v):
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return None
+            s = str(v).strip().lower()
+            if s in ("left", "l"):
+                return "left"
+            if s in ("right", "r"):
+                return "right"
+            return None
+
+        # 1) manual
+        side = norm_side(manual)
+        if side in ("left", "right"):
+            return side, "manual"
+
+        # 2) explicit columns in CSV
+        for col in ("throwing_side", "dominant_side", "handedness", "throwing_hand", "throw_side"):
+            if col in df.columns and df[col].notna().any():
+                side = norm_side(df[col].mode().iloc[0])
+                if side in ("left", "right"):
+                    return side, col
+
+        # 3) heuristic fallback
+        facing = self._safe_mode(df, "body_facing", default="unknown")
+        df_norm = self._normalize_coordinates(df, facing)
+        side = self._infer_handedness(df_norm)
+        return side, "heuristic"
+    
     def _pick_series(self, df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
         """Return first available series among candidates; else None."""
         for c in candidates:
@@ -344,21 +403,23 @@ class FixedMotionDTW:
             pts.append([x, y])
         return np.array(pts, dtype=float)
 
-    def _normalize_pose_frame(self, pts: np.ndarray, flip_x: bool = False) -> np.ndarray:
+    def _normalize_pose_frame(
+        self,
+        pts: np.ndarray,
+        flip_x: bool = False,
+        swap_lr: bool = False,
+    ) -> np.ndarray:
         """
         Normalize a single frame pose:
         - translation: origin at mid-hip
         - scale: shoulder width
         - optional mirror: flip x in local coords
+        - optional semantic mirror: swap left/right joint channels
         - rotation: align shoulder vector to x-axis
-
-        pts: (12,2) raw coords
-        returns: (12,2) normalized coords (NaN-safe)
         """
         pts_n = pts.copy()
 
-        # indices for shoulders and hips based on POSE_JOINTS order
-        # [L_sh, R_sh, L_hip, R_hip, ...]
+        # Original indices under POSE_JOINTS
         LSH, RSH = 0, 1
         LHIP, RHIP = 2, 3
 
@@ -367,38 +428,57 @@ class FixedMotionDTW:
         lsh = pts_n[LSH]
         rsh = pts_n[RSH]
 
-        if np.any(np.isnan(lhip)) or np.any(np.isnan(rhip)) or np.any(np.isnan(lsh)) or np.any(np.isnan(rsh)):
+        if (
+            np.any(np.isnan(lhip)) or
+            np.any(np.isnan(rhip)) or
+            np.any(np.isnan(lsh)) or
+            np.any(np.isnan(rsh))
+        ):
             return np.full_like(pts_n, np.nan)
 
+        # translation
         mid_hip = (lhip + rhip) / 2.0
-        pts_n = pts_n - mid_hip  # translation
+        pts_n = pts_n - mid_hip
 
+        # geometric mirror
         if flip_x:
-            pts_n[:, 0] = -pts_n[:, 0]  # mirror in local coords
+            pts_n[:, 0] = -pts_n[:, 0]
 
-        shoulder_vec = (rsh - lsh)
+        # semantic mirror: swap L/R joint slots
+        if swap_lr:
+            pts_n = self._swap_pose_lr_points(pts_n)
+
+        # recompute shoulders AFTER optional swap
+        lsh2 = pts_n[LSH]
+        rsh2 = pts_n[RSH]
+
+        # scale by shoulder width
+        shoulder_vec = rsh2 - lsh2
         sw = float(np.linalg.norm(shoulder_vec))
         if sw < 1e-6 or np.isnan(sw):
             sw = 1.0
-
-        pts_n = pts_n / sw  # scale
+        pts_n = pts_n / sw
 
         # rotation: align shoulder vector to x-axis
-        # after translation/flip/scale, recompute shoulder vector in normalized space
-        lsh2 = pts_n[LSH]
-        rsh2 = pts_n[RSH]
-        v = rsh2 - lsh2
+        lsh3 = pts_n[LSH]
+        rsh3 = pts_n[RSH]
+        v = rsh3 - lsh3
         if np.any(np.isnan(v)) or float(np.linalg.norm(v)) < 1e-6:
             return pts_n
 
         theta = float(np.arctan2(v[1], v[0]))
         c, s = float(np.cos(-theta)), float(np.sin(-theta))
         R = np.array([[c, -s], [s, c]], dtype=float)
-
         pts_rot = (R @ pts_n.T).T
         return pts_rot
 
-    def _build_pose_matrix(self, df: pd.DataFrame, flip_x: bool = False) -> np.ndarray:
+
+    def _build_pose_matrix(
+        self,
+        df: pd.DataFrame,
+        flip_x: bool = False,
+        swap_lr: bool = False,
+    ) -> np.ndarray:
         """
         Build normalized pose matrix for a whole clip:
         returns shape (T, D) where D=24 (12 points x 2).
@@ -406,7 +486,7 @@ class FixedMotionDTW:
         mats = []
         for _, row in df.iterrows():
             pts = self._get_pose_points_row(row)
-            pts_n = self._normalize_pose_frame(pts, flip_x=flip_x)
+            pts_n = self._normalize_pose_frame(pts, flip_x=flip_x, swap_lr=swap_lr)
             mats.append(pts_n.reshape(-1))  # flatten to (24,)
         mat = np.vstack(mats) if mats else np.zeros((0, 24), dtype=float)
         mat = self._interpolate_matrix(mat)
@@ -437,7 +517,11 @@ class FixedMotionDTW:
         ]
         return np.array(pts, dtype=float)
 
-    def _normalize_canonical_pose_frame(self, pts: np.ndarray) -> np.ndarray:
+    def _normalize_canonical_pose_frame(
+            self,
+            pts: np.ndarray,
+            flip_x: bool = False,
+        ) -> np.ndarray:
         """
         Normalize a single canonical frame:
         - translation: origin at mid-hip
@@ -468,6 +552,10 @@ class FixedMotionDTW:
         # translation
         mid_hip = (dom_hip + opp_hip) / 2.0
         pts_n = pts_n - mid_hip
+        
+        # geometric mirror for facing alignment
+        if flip_x:
+            pts_n[:, 0] = -pts_n[:, 0]
 
         # scale
         shoulder_vec = opp_sh - dom_sh
@@ -490,7 +578,12 @@ class FixedMotionDTW:
         pts_rot = (R @ pts_n.T).T
         return pts_rot
 
-    def _build_canonical_pose_matrix(self, df: pd.DataFrame, dominant_side: str) -> np.ndarray:
+    def _build_canonical_pose_matrix(
+        self,
+        df: pd.DataFrame,
+        dominant_side: str,
+        flip_x: bool = False,
+    ) -> np.ndarray:
         """
         Build normalized canonical pose matrix for a whole clip.
         returns shape (T, 24)
@@ -498,7 +591,7 @@ class FixedMotionDTW:
         mats = []
         for _, row in df.iterrows():
             pts = self._get_canonical_pose_points_row(row, dominant_side=dominant_side)
-            pts_n = self._normalize_canonical_pose_frame(pts)
+            pts_n = self._normalize_canonical_pose_frame(pts, flip_x=flip_x)
             mats.append(pts_n.reshape(-1))
 
         mat = np.vstack(mats) if mats else np.zeros((0, 24), dtype=float)
@@ -836,19 +929,10 @@ class FixedMotionDTW:
         student_facing = self._safe_mode(student_df, "body_facing", default="unknown")
 
         # Decide dominant side for student
-        if handedness in ("left", "right"):
-            dom = handedness
-            handedness_source = "manual"
-        else:
-            # AUTO: in your dataset, body_facing == dominant side
-            if student_facing in ("left", "right"):
-                dom = student_facing
-                handedness_source = "body_facing"
-            else:
-                # fallback: heuristic if body_facing is missing/unknown
-                df_norm_for_infer = self._normalize_coordinates(student_df, student_facing)
-                dom = self._infer_handedness(df_norm_for_infer)
-                handedness_source = "heuristic"
+        dom, handedness_source = self._resolve_dominant_side(
+            student_df,
+            manual=handedness if handedness in ("left", "right") else None,
+        )
 
         per_feature_score: Dict[str, float] = {}
         frame_distances_dict: Dict[str, np.ndarray] = {}
@@ -906,15 +990,26 @@ class FixedMotionDTW:
         # -----------------------------
         # Branch B: Pure coordinate DTW + pure coordinate scoring
         # -----------------------------
+        
+        ref_facing_lr = str(self.reference_facing).strip().lower()
+        stu_facing_lr = str(student_facing).strip().lower()
+
+        flip_student_pose = (
+            ref_facing_lr in ("left", "right")
+            and stu_facing_lr in ("left", "right")
+            and ref_facing_lr != stu_facing_lr
+        )
+        
         ref_pose = self._build_canonical_pose_matrix(
             self.reference_df,
             dominant_side=self.reference_handedness,
+            flip_x=False,
         )
         stu_pose = self._build_canonical_pose_matrix(
             student_df,
             dominant_side=dom,
+            flip_x=flip_student_pose,
         )
-
         pose_dtw_norm, pose_path = self._compute_pose_dtw_path(ref_pose, stu_pose)
         map_s_to_m = self._path_to_map_s_to_m(pose_path, n_student=len(student_df))
         

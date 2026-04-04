@@ -19,14 +19,9 @@ from render_side_by_side import (
     crop_csv_to_rect,
     _expand_rect_to_size,
     render_side_by_side_points,
-    compute_mean_normalized_error,
-    MAIN_JOINTS,
-    read_map_csv,
-    _load_xy_pairs_cached,
 )
 from criteria_eval import evaluate_criteria
 from result_logic import (
-    build_score_obj,
     load_score_params_from_env,
     score_message,
     collect_ui_like_feedback,
@@ -241,36 +236,6 @@ def _ui_like_postprocess_one_job(
         )
         criteria_path.write_text(
             json.dumps(criteria_obj, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        # ---------- 9) score.json ----------
-        score_path = throw_dir / "score.json"
-
-        # --- 基于躯干长度进行动态缩放 ---
-        stu_torso = _get_median_torso_length(str(crop_csv))
-        mdl_torso = _get_median_torso_length(str(model_crop_csv))
-
-        if stu_torso is not None and mdl_torso is not None and mdl_torso > 1e-6:
-            dynamic_scale = stu_torso / mdl_torso
-        else:
-            dynamic_scale = hs / max(hm, 1)
-
-        mean_err = compute_mean_normalized_error(
-            map_s_to_m=read_map_csv(str(map_csv)),
-            stu_xy=_load_xy_pairs_cached(str(crop_csv)),
-            mdl_xy=_load_xy_pairs_cached(str(model_crop_csv)),
-            ws=ws,
-            out_h=hs,
-            wm=wm,
-            model_scale=dynamic_scale,
-            flip_model=flip_needed,
-            joints=[j for j in MAIN_JOINTS],
-        )
-
-        score_obj = build_score_obj(mean_err, **score_params)
-        score_path.write_text(
-            json.dumps(score_obj, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 

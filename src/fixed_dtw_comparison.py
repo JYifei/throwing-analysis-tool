@@ -166,20 +166,19 @@ class FixedMotionDTW:
         return col in df.columns and df[col].notna().any()
 
     def _resolve_dominant_side(
-        self,
-        df: pd.DataFrame,
-        manual: Optional[str] = None,
-    ) -> Tuple[str, str]:
+    self,
+    df: pd.DataFrame,
+    manual: Optional[str] = None,
+) -> Tuple[str, str]:
         """
-        Resolve dominant / throwing side.
+        LOCKED POLICY:
+        body_facing == dominant_side whenever body_facing is available.
 
         Priority:
-        1) manual argument
-        2) explicit CSV columns such as throwing_side / dominant_side / handedness
-        3) heuristic inference
-
-        IMPORTANT:
-        body_facing is NOT used as dominant side.
+        1) body_facing
+        2) manual argument (fallback only if body_facing missing)
+        3) explicit CSV handedness columns
+        4) heuristic inference
         """
         def norm_side(v):
             if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -191,24 +190,29 @@ class FixedMotionDTW:
                 return "right"
             return None
 
-        # 1) manual
+        # 1) LOCK dominant side to body_facing
+        facing_side = norm_side(self._safe_mode(df, "body_facing", default=None))
+        if facing_side in ("left", "right"):
+            return facing_side, "body_facing_locked"
+
+        # 2) manual fallback only when body_facing missing
         side = norm_side(manual)
         if side in ("left", "right"):
-            return side, "manual"
+            return side, "manual_fallback"
 
-        # 2) explicit columns in CSV
+        # 3) explicit columns fallback
         for col in ("throwing_side", "dominant_side", "handedness", "throwing_hand", "throw_side"):
             if col in df.columns and df[col].notna().any():
                 side = norm_side(df[col].mode().iloc[0])
                 if side in ("left", "right"):
-                    return side, col
+                    return side, f"{col}_fallback"
 
-        # 3) heuristic fallback
+        # 4) heuristic fallback
         facing = self._safe_mode(df, "body_facing", default="unknown")
         df_norm = self._normalize_coordinates(df, facing)
         side = self._infer_handedness(df_norm)
-        return side, "heuristic"
-    
+        return side, "heuristic_fallback"
+        
     def _pick_series(self, df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
         """Return first available series among candidates; else None."""
         for c in candidates:
@@ -989,8 +993,11 @@ class FixedMotionDTW:
 
         # -----------------------------
         # Branch B: Pure coordinate DTW + pure coordinate scoring
+        # body_facing is locked as dominant_side through _resolve_dominant_side().
+        # Therefore canonical dom/opp ordering already performs the semantic remapping.
+        # Here we only need geometric x-flip when student/reference facings differ.
+        # DO NOT add another canonical semantic swap here, otherwise it will double-swap.
         # -----------------------------
-        
         ref_facing_lr = str(self.reference_facing).strip().lower()
         stu_facing_lr = str(student_facing).strip().lower()
 
@@ -999,7 +1006,7 @@ class FixedMotionDTW:
             and stu_facing_lr in ("left", "right")
             and ref_facing_lr != stu_facing_lr
         )
-        
+
         ref_pose = self._build_canonical_pose_matrix(
             self.reference_df,
             dominant_side=self.reference_handedness,
@@ -1012,7 +1019,6 @@ class FixedMotionDTW:
         )
         pose_dtw_norm, pose_path = self._compute_pose_dtw_path(ref_pose, stu_pose)
         map_s_to_m = self._path_to_map_s_to_m(pose_path, n_student=len(student_df))
-        
         if save_frame_csv and save_align_path:
             self._save_pose_align_path_csv(student_csv, pose_path)
             self._save_pose_align_map_csv(student_csv, map_s_to_m)
@@ -1247,16 +1253,11 @@ def export_signed_deltas_from_align_map(
     student_df = pd.read_csv(student_csv)
     ref_df = comparator.reference_df
 
-    # infer facing/dominant like compare() does
     student_facing = comparator._safe_mode(student_df, "body_facing", default="unknown")
-    if handedness in ("left", "right"):
-        dom = handedness
-    else:
-        if student_facing in ("left", "right"):
-            dom = student_facing
-        else:
-            df_norm_for_infer = comparator._normalize_coordinates(student_df, student_facing)
-            dom = comparator._infer_handedness(df_norm_for_infer)
+    dom, dom_source = comparator._resolve_dominant_side(
+        student_df,
+        manual=handedness if handedness in ("left", "right") else None,
+    )
 
     # extract features
     ref_feats = comparator.reference_features

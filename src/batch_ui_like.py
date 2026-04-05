@@ -25,6 +25,7 @@ from result_logic import (
     load_score_params_from_env,
     score_message,
     collect_ui_like_feedback,
+    build_score_obj,
 )
 
 # -------------------------
@@ -238,6 +239,24 @@ def _ui_like_postprocess_one_job(
             json.dumps(criteria_obj, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        
+        # ---------- 9) score.json ----------
+        score_path = throw_dir / "score.json"
+
+        if score_path.exists():
+            score_obj = json.loads(score_path.read_text(encoding="utf-8"))
+            dtw_obj = score_obj.get("dtw", {}) if isinstance(score_obj, dict) else {}
+            dtw_overall = dtw_obj.get("overall_matching_score", None)
+
+            if dtw_overall is not None:
+                ui_score_obj = build_score_obj(float(dtw_overall), **score_params)
+                ui_score_obj["dtw"] = dtw_obj
+                score_path.write_text(
+                    json.dumps(ui_score_obj, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        else:
+            print(f"[WARN] score.json missing before UI-like score postprocess: {score_path}")
 
         # ---------- 10) Update manifest entry ----------
         for tt in manifest_obj.get("throws", []) or []:

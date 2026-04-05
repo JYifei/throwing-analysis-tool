@@ -6,9 +6,9 @@ from typing import Any, Dict, List, Optional
 
 
 DEFAULT_SCORE_PARAMS = {
-    "t1": 0.30,
-    "t2": 0.90,
-    "t3": 1.80,
+    "t1": 1.0,
+    "t2": 2.2,
+    "t3": 4.6,
     "s1": 95.0,
     "s2": 40.0,
 }

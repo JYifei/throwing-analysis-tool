@@ -243,7 +243,7 @@ def crit2_rotate_nonthrow_side_faces_target_details(
     shoulder_len_norm = float(shoulder_len / sc)
 
     # Threshold (reuse old OPEN_MIN as a stable starting point)
-    SHOULDER_LEN_THR = 0.55
+    SHOULDER_LEN_THR = 0.45
     passed = (shoulder_len_norm >= SHOULDER_LEN_THR)
 
     return CriterionDebug(
@@ -334,7 +334,7 @@ def crit3_step_forward_with_nonthrow_foot_details(
 
     # Thresholds
     STEP_X_TINY_THR = 0.1
-    STEP_X_THR = 1.0
+    STEP_X_THR = 0.5
 
     # Wrong-foot heuristic:
     # if the correct foot does not pass, but the wrong foot moves clearly forward,

@@ -9,7 +9,7 @@ import pandas as pd
 
 # ===== Model Windows =====
 DEFAULT_MODEL_WINDOWS: Dict[str, Tuple[int, int]] = {
-    "c1": (0, 10),    
+    "c1": (0, 40),    
     "c2": (0, 40),    
     "c3": (10, 40),   
     "c4": (40, 55),   
@@ -109,69 +109,250 @@ def torso_scale(df: pd.DataFrame) -> np.ndarray:
 # Criteria implementations
 # =============================================================================
 
+def _clip01(x: float) -> float:
+    return float(np.clip(x, 0.0, 1.0))
+
+
+def _linear_score(x: float, lo: float, hi: float) -> float:
+    """
+    0 below lo, 1 above hi, linear in between.
+    """
+    if not np.isfinite(x):
+        return 0.0
+    if hi <= lo:
+        return 1.0 if x >= hi else 0.0
+    return _clip01((x - lo) / (hi - lo))
+
+
+def _joint_angle_deg(ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> float:
+    """
+    Angle ABC in degrees, measured at point B.
+    """
+    ba = np.array([ax - bx, ay - by], dtype=float)
+    bc = np.array([cx - bx, cy - by], dtype=float)
+
+    nba = float(np.linalg.norm(ba))
+    nbc = float(np.linalg.norm(bc))
+    if nba <= 1e-6 or nbc <= 1e-6:
+        return float("nan")
+
+    cosang = float(np.dot(ba, bc) / (nba * nbc))
+    cosang = float(np.clip(cosang, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosang)))
+
+
 def crit1_windup_downward_hand_arm_details(
     df: pd.DataFrame,
     a: int,
     b: int,
     throwing_side: str,
 ) -> CriterionDebug:
+    """
+    Detect the best L-shape preparation pose within the C1 window.
+
+    New logic:
+    - Do NOT require a specific starting position
+    - Do NOT require a downward swing path
+    - Search the whole window for the best single-frame L-shape pose
+
+    L-shape score is a weighted combination of:
+    1) elbow bend close to ~95 deg
+    2) elbow raised near shoulder height
+    3) wrist raised near shoulder height
+    4) wrist brought back behind the throwing shoulder
+    """
+
+    # Throw direction:
+    # right throw -> target_sign = +1 (forward is increasing x)
+    # left throw  -> target_sign = -1 (forward is decreasing x)
+    target_sign = -1 if throwing_side == "left" else +1
+
     if throwing_side == "left":
+        shoulder = "left_shoulder"
+        elbow = "left_elbow"
         wrist = "left_wrist"
     else:
+        shoulder = "right_shoulder"
+        elbow = "right_elbow"
         wrist = "right_wrist"
 
+    sx, sy = load_xy(df, shoulder)
+    ex, ey = load_xy(df, elbow)
     wx, wy = load_xy(df, wrist)
     scale = torso_scale(df)
 
     a = max(0, int(a))
-    b = min(len(wy) - 1, int(b))
+    b = min(len(sx) - 1, int(b))
     if b <= a:
         return _fail(["invalid_window"], valid_frames=0)
 
+    seg_sx = sx[a:b+1]
+    seg_sy = sy[a:b+1]
+    seg_ex = ex[a:b+1]
+    seg_ey = ey[a:b+1]
+    seg_wx = wx[a:b+1]
     seg_wy = wy[a:b+1]
     seg_sc = scale[a:b+1]
 
-    m_w = np.isfinite(seg_wy) & np.isfinite(seg_sc)
+    m = (
+        np.isfinite(seg_sx) & np.isfinite(seg_sy) &
+        np.isfinite(seg_ex) & np.isfinite(seg_ey) &
+        np.isfinite(seg_wx) & np.isfinite(seg_wy) &
+        np.isfinite(seg_sc)
+    )
 
-    if int(m_w.sum()) < 3:
-        return _fail(["too_few_valid_frames"], valid_frames=int(m_w.sum()))
+    valid_frames = int(m.sum())
+    if valid_frames < 3:
+        return _fail(["too_few_valid_frames"], valid_frames=valid_frames)
 
-    valid_wy = seg_wy[m_w]
+    # -----------------------------
+    # Tunable thresholds / weights
+    # -----------------------------
+    ANGLE_CENTER = 95.0
+    ANGLE_TOL = 40.0
 
-    # First 20% of the preparation window
-    kw = max(2, int(len(valid_wy) * 0.2))
+    ELBOW_ANGLE_MIN = 45.0
+    ELBOW_ANGLE_MAX = 145.0
 
-    # Starting reference: maximum wrist y in the first 20% (highest position before drop)
-    wy0 = float(np.max(valid_wy[:kw]))
+    # y increases downward in image coordinates
+    # positive value means elbow/wrist is higher than shoulder
+    ELBOW_UP_LO = -0.15
+    ELBOW_UP_HI = 0.05
 
-    # Lowest wrist position within the full window (largest y)
-    wy_max = float(np.max(valid_wy))
+    WRIST_UP_LO = -0.10
+    WRIST_UP_HI = 0.10
 
-    # Robust torso scale normalization
-    sc = float(np.nanmedian(seg_sc[np.isfinite(seg_sc)]))
-    if not np.isfinite(sc) or sc <= 1e-6:
-        sc = 1.0
+    # positive means wrist is "behind" shoulder relative to target direction
+    BACK_LO = -0.05
+    BACK_HI = 0.12
 
-    # Normalized wrist drop
-    dw = float((wy_max - wy0) / sc)
+    W_BEND = 0.45
+    W_ELBOW_UP = 0.20
+    W_WRIST_UP = 0.20
+    W_BACK = 0.15
 
-    DW_THR = 0.4
+    C1_PASS_THR = 0.58
 
-    passed = (dw >= DW_THR)
+    best_rel_idx = None
+    best_total = -np.inf
+    best_angle = float("nan")
+    best_elbow_up = float("nan")
+    best_wrist_up = float("nan")
+    best_backness = float("nan")
+    best_bend_score = float("nan")
+    best_elbow_up_score = float("nan")
+    best_wrist_up_score = float("nan")
+    best_back_score = float("nan")
+    best_scale = float("nan")
+
+    for i in range(len(seg_sx)):
+        if not m[i]:
+            continue
+
+        sc = float(seg_sc[i])
+        if not np.isfinite(sc) or sc <= 1e-6:
+            continue
+
+        angle_deg = _joint_angle_deg(
+            seg_sx[i], seg_sy[i],
+            seg_ex[i], seg_ey[i],
+            seg_wx[i], seg_wy[i],
+        )
+        if not np.isfinite(angle_deg):
+            continue
+
+        # Positive means elbow/wrist is higher than shoulder
+        elbow_up = float((seg_sy[i] - seg_ey[i]) / sc)
+        wrist_up = float((seg_sy[i] - seg_wy[i]) / sc)
+
+        # Positive means wrist is pulled back behind shoulder
+        backness = float(target_sign * (seg_sx[i] - seg_wx[i]) / sc)
+
+        bend_score = _clip01(1.0 - abs(angle_deg - ANGLE_CENTER) / ANGLE_TOL)
+        elbow_up_score = _linear_score(elbow_up, ELBOW_UP_LO, ELBOW_UP_HI)
+        wrist_up_score = _linear_score(wrist_up, WRIST_UP_LO, WRIST_UP_HI)
+        back_score = _linear_score(backness, BACK_LO, BACK_HI)
+
+        total = (
+            W_BEND * bend_score +
+            W_ELBOW_UP * elbow_up_score +
+            W_WRIST_UP * wrist_up_score +
+            W_BACK * back_score
+        )
+
+        if total > best_total:
+            best_total = float(total)
+            best_rel_idx = int(i)
+            best_angle = float(angle_deg)
+            best_elbow_up = float(elbow_up)
+            best_wrist_up = float(wrist_up)
+            best_backness = float(backness)
+            best_bend_score = float(bend_score)
+            best_elbow_up_score = float(elbow_up_score)
+            best_wrist_up_score = float(wrist_up_score)
+            best_back_score = float(back_score)
+            best_scale = float(sc)
+
+    if best_rel_idx is None or not np.isfinite(best_total):
+        return _fail(["no_valid_pose_frame"], valid_frames=valid_frames)
+
+    best_abs_idx = a + best_rel_idx
+
+    # Hard guard: avoid obviously non-L-shape poses passing accidentally
+    angle_guard_pass = bool(ELBOW_ANGLE_MIN <= best_angle <= ELBOW_ANGLE_MAX)
+
+    passed = bool(angle_guard_pass and (best_total >= C1_PASS_THR))
+
+    notes: List[str] = []
+    if not passed:
+        if not angle_guard_pass:
+            notes.append("elbow_not_bent_into_l_shape")
+        if best_elbow_up < ELBOW_UP_LO and best_wrist_up < WRIST_UP_LO:
+            notes.append("arm_not_up_near_shoulder")
+        else:
+            if best_elbow_up < ELBOW_UP_LO:
+                notes.append("elbow_too_low_for_l_shape")
+            if best_wrist_up < WRIST_UP_LO:
+                notes.append("wrist_too_low_for_l_shape")
+        if best_backness < BACK_LO:
+            notes.append("hand_not_brought_back")
+        if not notes:
+            notes.append("l_shape_pose_not_clear_enough")
 
     return CriterionDebug(
-        passed=bool(passed),
+        passed=passed,
         metrics={
-            "dw": dw,
-            "wy0": wy0,
-            "wy_max": wy_max,
-            "scale_median": float(sc),
+            "best_frame_idx": float(best_abs_idx),
+            "best_score": float(best_total),
+            "best_angle_deg": float(best_angle),
+            "best_elbow_up": float(best_elbow_up),
+            "best_wrist_up": float(best_wrist_up),
+            "best_backness": float(best_backness),
+            "bend_score": float(best_bend_score),
+            "elbow_up_score": float(best_elbow_up_score),
+            "wrist_up_score": float(best_wrist_up_score),
+            "back_score": float(best_back_score),
+            "scale_at_best": float(best_scale),
         },
         thresholds={
-            "DW_THR": DW_THR,
+            "ANGLE_CENTER": float(ANGLE_CENTER),
+            "ANGLE_TOL": float(ANGLE_TOL),
+            "ELBOW_ANGLE_MIN": float(ELBOW_ANGLE_MIN),
+            "ELBOW_ANGLE_MAX": float(ELBOW_ANGLE_MAX),
+            "ELBOW_UP_LO": float(ELBOW_UP_LO),
+            "ELBOW_UP_HI": float(ELBOW_UP_HI),
+            "WRIST_UP_LO": float(WRIST_UP_LO),
+            "WRIST_UP_HI": float(WRIST_UP_HI),
+            "BACK_LO": float(BACK_LO),
+            "BACK_HI": float(BACK_HI),
+            "W_BEND": float(W_BEND),
+            "W_ELBOW_UP": float(W_ELBOW_UP),
+            "W_WRIST_UP": float(W_WRIST_UP),
+            "W_BACK": float(W_BACK),
+            "C1_PASS_THR": float(C1_PASS_THR),
         },
-        notes=[] if passed else ["windup_wrist_drop_not_enough"],
-        valid_frames=int(m_w.sum()),
+        notes=notes,
+        valid_frames=valid_frames,
     )
 
 def crit2_rotate_nonthrow_side_faces_target_details(
@@ -182,18 +363,30 @@ def crit2_rotate_nonthrow_side_faces_target_details(
     target_sign: int,
     nonthrow_side: str,
 ) -> CriterionDebug:
-    # Derive throwing side from non-throwing side (to keep call sites unchanged)
-    if nonthrow_side == "left":
-        throwing_side = "right"
-    else:
-        throwing_side = "left"
+    """
+    C2: Open the shoulder
 
-    # Select wrist by throwing side
+    New logic:
+    1) Find the student's max pull-back moment (same as before)
+    2) Measure shoulder width at that moment
+    3) Estimate a personal baseline shoulder width using the 25th percentile
+       of shoulder_len_norm inside the whole C2 window
+    4) Use shoulder opening gain = width_at_t_back - baseline
+    5) Pass only if:
+         - gain is large enough
+         - absolute shoulder width is not too small
+    """
+
+    # Derive throwing side from non-throwing side
+    throwing_side = "right" if nonthrow_side == "left" else "left"
+
+    # Throwing wrist
     if throwing_side == "left":
         wx, wy = load_xy(df, "left_wrist")
     else:
         wx, wy = load_xy(df, "right_wrist")
 
+    # Hips / shoulders
     lhx, lhy = load_xy(df, "left_hip")
     rhx, rhy = load_xy(df, "right_hip")
     lsx, lsy = load_xy(df, "left_shoulder")
@@ -216,51 +409,83 @@ def crit2_rotate_nonthrow_side_faces_target_details(
     # Hip center x
     hip_cx = (seg_lhx + seg_rhx) / 2.0
 
-    # Most pull-back moment: maximize target_sign * (hip_cx - wrist_x)
+    # Max pull-back moment
     backness = target_sign * (hip_cx - seg_wx)
+
+    # Shoulder width (raw and normalized) for every frame
+    shoulder_len_raw_all = np.abs(seg_lsx - seg_rsx)
+    shoulder_len_norm_all = np.full_like(shoulder_len_raw_all, np.nan, dtype=float)
 
     m = (
         np.isfinite(backness) &
         np.isfinite(seg_lsx) & np.isfinite(seg_rsx) &
-        np.isfinite(seg_sc)
+        np.isfinite(seg_sc) & (seg_sc > 1e-6)
     )
+    shoulder_len_norm_all[m] = shoulder_len_raw_all[m] / seg_sc[m]
+
     if int(m.sum()) < 5:
         return _fail(["too_few_valid_frames"], valid_frames=int(m.sum()))
 
+    # Find t_back using max pull-back among valid frames
     backness_valid = backness.copy()
     backness_valid[~m] = -np.inf
     idx_rel = int(np.argmax(backness_valid))
     t_back = a + idx_rel
 
-    # Shoulder length at t_back (normalized)
-    shoulder_len = float(np.abs(seg_lsx[idx_rel] - seg_rsx[idx_rel]))
+    shoulder_len_raw = float(shoulder_len_raw_all[idx_rel])
     sc = float(seg_sc[idx_rel])
     if not np.isfinite(sc) or sc <= 1e-6:
         sc = float(np.nanmedian(seg_sc[np.isfinite(seg_sc)]))
         if not np.isfinite(sc) or sc <= 1e-6:
             sc = 1.0
 
-    shoulder_len_norm = float(shoulder_len / sc)
+    shoulder_len_norm = float(shoulder_len_raw / sc)
 
-    # Threshold (reuse old OPEN_MIN as a stable starting point)
-    SHOULDER_LEN_THR = 0.45
-    passed = (shoulder_len_norm >= SHOULDER_LEN_THR)
+    # Personal baseline: 25th percentile of normalized shoulder width
+    valid_norm = shoulder_len_norm_all[np.isfinite(shoulder_len_norm_all)]
+    if len(valid_norm) < 5:
+        return _fail(["too_few_valid_shoulder_frames"], valid_frames=int(len(valid_norm)))
+
+    BASELINE_Q = 0.25
+    baseline_shoulder_len_p25 = float(np.nanquantile(valid_norm, BASELINE_Q))
+
+    # Gain relative to personal baseline
+    shoulder_open_gain = float(shoulder_len_norm - baseline_shoulder_len_p25)
+
+    # Thresholds
+    SHOULDER_OPEN_GAIN_THR = 0.1
+    SHOULDER_LEN_ABS_MIN = 0.35
+
+    gain_pass = (shoulder_open_gain >= SHOULDER_OPEN_GAIN_THR)
+    abs_pass = (shoulder_len_norm >= SHOULDER_LEN_ABS_MIN)
+    passed = bool(gain_pass and abs_pass)
+
+    notes = []
+    if not gain_pass:
+        notes.append("shoulder_not_opened_enough_from_baseline")
+    if not abs_pass:
+        notes.append("shoulder_width_at_pullback_too_small")
 
     return CriterionDebug(
-        passed=bool(passed),
+        passed=passed,
         metrics={
             "t_back": float(t_back),
             "backness_max": float(backness_valid[idx_rel]),
-            "shoulder_len_norm": shoulder_len_norm,
-            "shoulder_len_raw": float(shoulder_len),
+            "shoulder_len_norm": shoulder_len_norm,  # keep old key for compatibility
+            "shoulder_len_raw": float(shoulder_len_raw),
+            "baseline_shoulder_len_p25": float(baseline_shoulder_len_p25),
+            "shoulder_open_gain": float(shoulder_open_gain),
             "scale_at_t_back": float(sc),
             "target_sign": float(target_sign),
-            "nonthrow_side": float(0 if nonthrow_side == "left" else 1),  # keep traceability
+            "nonthrow_side": float(0 if nonthrow_side == "left" else 1),
+            "baseline_q": float(BASELINE_Q),
         },
         thresholds={
-            "SHOULDER_LEN_THR": SHOULDER_LEN_THR,
+            "SHOULDER_OPEN_GAIN_THR": float(SHOULDER_OPEN_GAIN_THR),
+            "SHOULDER_LEN_ABS_MIN": float(SHOULDER_LEN_ABS_MIN),
+            "BASELINE_Q": float(BASELINE_Q),
         },
-        notes=[] if passed else ["shoulder_length_at_max_pullback_too_small"],
+        notes=notes,
         valid_frames=int(m.sum()),
     )
 

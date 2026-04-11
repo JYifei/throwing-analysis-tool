@@ -31,7 +31,11 @@ from src.render_side_by_side import (
     _load_xy_pairs_cached,
 )
 from src.criteria_eval import evaluate_criteria
-from src.result_logic import build_score_obj, load_score_params_from_env
+from src.result_logic import (
+    build_score_obj,
+    load_score_params_from_env,
+    annotate_criteria_with_severity,
+)
 
 
 
@@ -267,11 +271,13 @@ def create_job(
                     model_windows=None,                 # 先用 src/criteria_eval.py 里的 DEFAULT_MODEL_WINDOWS
                 )
 
+                criteria_obj = annotate_criteria_with_severity(criteria_obj)
+
+                
                 criteria_path.write_text(
                     json.dumps(criteria_obj, ensure_ascii=False, indent=2),
                     encoding="utf-8"
                 )
-
 
                 # ---------- 9) score.json ----------
                 # Do NOT recompute score here.

@@ -159,6 +159,178 @@ def _extra_signal_triggered(value: Any) -> bool:
             return not bool(value["passed"])
     return False
 
+def _clip01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def _safe_float(d: Dict[str, Any], key: str, default: float = float("nan")) -> float:
+    try:
+        v = d.get(key, default)
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _normalized_shortfall(value: float, thr: float) -> float:
+    """
+    For metrics where larger is better.
+    0 means no deficit, 1 means very bad / missing badly.
+    """
+    if not math.isfinite(value) or not math.isfinite(thr):
+        return 1.0
+    if thr <= 1e-6:
+        return 0.0 if value >= thr else 1.0
+    return _clip01((thr - value) / thr)
+
+def _piecewise_larger_better(value: float, bad: float, passed: float) -> float:
+    if not math.isfinite(value):
+        return 1.0
+    if passed <= bad:
+        return 0.0 if value >= passed else 1.0
+    if value >= passed:
+        return 0.0
+    if value <= bad:
+        return 1.0
+    return _clip01((passed - value) / (passed - bad))
+
+
+def _piecewise_smaller_better(value: float, passed: float, bad: float) -> float:
+    if not math.isfinite(value):
+        return 1.0
+    if bad <= passed:
+        return 0.0 if value <= passed else 1.0
+    if value <= passed:
+        return 0.0
+    if value >= bad:
+        return 1.0
+    return _clip01((value - passed) / (bad - passed))
+
+def _criterion_deficit(item: Dict[str, Any]) -> float:
+    """
+    Return a normalized deficit in [0, 1].
+    0 = no problem, 1 = very severe problem.
+    """
+    key = str(item.get("key", ""))
+    student = item.get("student", {}) or {}
+    metrics = student.get("metrics", {}) or {}
+    thresholds = student.get("thresholds", {}) or {}
+    notes = student.get("notes", []) or []
+
+    if bool(student.get("passed", False)):
+        return 0.0
+
+    # C1: best-pose score shortfall
+    if key == "c1":
+        score = _safe_float(metrics, "best_score")
+        thr = _safe_float(thresholds, "C1_PASS_THR")
+        if math.isfinite(score) and math.isfinite(thr) and thr > 1e-6:
+            return _clip01((thr - score) / thr)
+        return 1.0
+
+    # C2: shoulder opening shortfall
+    if key == "c2":
+        gain = _safe_float(metrics, "shoulder_open_gain")
+        thr = _safe_float(thresholds, "SHOULDER_OPEN_GAIN_THR")
+
+        # gain is already baseline-corrected, so 0 means "no opening beyond baseline"
+        if math.isfinite(gain) and math.isfinite(thr) and thr > 1e-6:
+            return _clip01((thr - gain) / thr)
+        return 1.0
+
+    # C3
+    if key == "c3":
+        if "step_with_wrong_foot" in notes:
+            return 1.0
+
+        val = _safe_float(metrics, "disp_x_norm")
+        bad = _safe_float(thresholds, "STEP_X_TINY_THR")   # 0.1
+        passed = _safe_float(thresholds, "STEP_X_THR")     # 0.5
+        return _piecewise_larger_better(val, bad, passed)
+
+    # C4
+    if key == "c4":
+        lead = _safe_float(metrics, "lead_max_tail_norm")
+        hip_dist = _safe_float(metrics, "min_dn_tail")
+
+        LEAD_PASS = _safe_float(thresholds, "LEAD_THR")    # 0.0
+        LEAD_BAD = -0.15
+
+        HIP_PASS = _safe_float(thresholds, "NEAR_HIP_THR") # 0.60
+        HIP_BAD = 1.00
+
+        notes_set = set(str(x) for x in notes)
+
+        d_lead = 0.0
+        if "throwing_shoulder_not_leading_target" in notes_set:
+            d_lead = _piecewise_larger_better(lead, LEAD_BAD, LEAD_PASS)
+
+        d_hip = 0.0
+        if "hand_not_close_enough_to_opposite_hip" in notes_set:
+            d_hip = _piecewise_smaller_better(hip_dist, HIP_PASS, HIP_BAD)
+
+        return max(d_lead, d_hip)
+
+    # Fallback
+    return 1.0
+
+
+def _criterion_importance_weight(item: Dict[str, Any]) -> float:
+    key = str(item.get("key", ""))
+
+    # Teaching-oriented priority
+    if key == "c3":
+        return 1
+    if key == "c2":
+        return 1
+    if key == "c1":
+        return 1
+    if key == "c4":
+        return 1
+    return 1.00
+
+
+def _criterion_severity(item: Dict[str, Any]) -> float:
+    return _criterion_importance_weight(item) * _criterion_deficit(item)
+
+def annotate_criteria_with_severity(criteria_obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Mutate and return criteria_obj by adding per-item severity info
+    into each student's block, plus a top-level ranking for debugging.
+    """
+    items = criteria_obj.get("items", []) or []
+
+    ranking: List[Dict[str, Any]] = []
+
+    for idx, item in enumerate(items):
+        student = item.get("student", {}) or {}
+
+        deficit = _criterion_deficit(item)
+        weight = _criterion_importance_weight(item)
+        severity = _criterion_severity(item)
+
+        student["deficit"] = round(float(deficit), 4)
+        student["importance_weight"] = round(float(weight), 4)
+        student["severity"] = round(float(severity), 4)
+
+        ranking.append({
+            "key": str(item.get("key", "")),
+            "name": str(item.get("name", "")),
+            "passed": bool(student.get("passed", False)),
+            "deficit": round(float(deficit), 4),
+            "importance_weight": round(float(weight), 4),
+            "severity": round(float(severity), 4),
+            "original_order": idx,
+        })
+
+        item["student"] = student
+
+    ranking.sort(key=lambda x: (-x["severity"], x["original_order"]))
+
+    criteria_obj["severity_ranking"] = ranking
+    return criteria_obj
+
 
 def collect_ui_like_feedback(criteria_obj: Dict[str, Any], matching_percent: float) -> List[str]:
     limit = feedback_limit_by_score(float(matching_percent))
@@ -166,21 +338,28 @@ def collect_ui_like_feedback(criteria_obj: Dict[str, Any], matching_percent: flo
         return []
 
     feedbacks: List[str] = []
-
     items = criteria_obj.get("items", []) or []
-    for item in items:
+
+    ranked_failed = []
+    for idx, item in enumerate(items):
         student = item.get("student", {}) or {}
-        passed = bool(student.get("passed", False))
-        if passed:
+        if bool(student.get("passed", False)):
             continue
 
+        sev = _criterion_severity(item)
+        ranked_failed.append((sev, idx, item))
+
+    # Higher severity first; keep original order as tie-breaker
+    ranked_failed.sort(key=lambda x: (-x[0], x[1]))
+
+    for sev, idx, item in ranked_failed:
         txt = feedback_text_for_item(item)
         if txt and txt not in feedbacks:
             feedbacks.append(txt)
-
         if len(feedbacks) >= limit:
             return feedbacks[:limit]
 
+    # Keep extra signals after the main criteria
     extra = criteria_obj.get("extra_feedback_signals", {}) or {}
     if isinstance(extra, dict):
         for key, value in extra.items():

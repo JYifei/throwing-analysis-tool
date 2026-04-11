@@ -317,138 +317,74 @@
       return null;
     }
 
-        function computeTopFeedback(criteriaObj, maxItems = 2) {
-      const items = (criteriaObj && criteriaObj.items) ? criteriaObj.items : [];
-      const failed = [];
 
-      // === main criteria (c1-c4) ===
-      for (const it of items) {
-        const passed = (typeof it?.student?.passed === "boolean") ? it.student.passed : !!it.passed;
-        if (passed) continue;
+function computeTopFeedback(criteriaObj, maxItems = 2) {
+  const out = [];
+  const seen = new Set();
 
-        const key = String(it?.key || "");
-        const m = (it && it.student && it.student.metrics) ? it.student.metrics : {};
-        const th = (it && it.student && it.student.thresholds) ? it.student.thresholds : {};
+  const items = Array.isArray(criteriaObj?.items) ? criteriaObj.items : [];
+  const byKey = new Map(items.map(it => [String(it?.key || ""), it]));
 
-        let sev = 0.0;
+  // 1) 优先用后端给出的 severity_ranking
+  const ranking = Array.isArray(criteriaObj?.severity_ranking)
+    ? criteriaObj.severity_ranking
+    : [];
 
-        if (key === "c1") {
-          const dw = Number(m.dw);
-          const thr = Number(th.DW_THR);
-          if (Number.isFinite(dw) && Number.isFinite(thr) && thr > 1e-9) {
-            sev = Math.max(0, (thr - dw) / thr);
-          } else {
-            sev = 0.5;
-          }
-        } else if (key === "c2") {
-          const v = Number(m.shoulder_len_norm);
-          const thr = Number(th.SHOULDER_LEN_THR);
-          if (Number.isFinite(v) && Number.isFinite(thr) && thr > 1e-9) {
-            sev = Math.max(0, (thr - v) / thr);
-          } else {
-            sev = 0.5;
-          }
-        } else if (key === "c3") {
-          const v = Number(m.disp_x_norm);
-          const thr = Number(th.STEP_X_THR);
-          const eps = Number(th.STEP_X_TINY_THR);
-          if (Number.isFinite(v) && Number.isFinite(thr) && thr > 1e-9) {
-            if (Number.isFinite(eps) && v <= eps) sev = 1.0;
-            else sev = Math.max(0, (thr - v) / thr);
-          } else {
-            sev = 0.5;
-          }
-        } else if (key === "c4") {
-          const nearThr = Number(th.NEAR_HIP_THR);
-          const dn = Number(m.min_dn_tail);
+  if (ranking.length > 0) {
+    for (const r of ranking) {
+      if (r?.passed) continue;
 
-          let sevDist = 0.0;
-          if (Number.isFinite(dn) && Number.isFinite(nearThr) && nearThr > 1e-9) {
-            sevDist = Math.max(0, (dn - nearThr) / nearThr);
-          }
+      const key = String(r?.key || "");
+      const item = byKey.get(key);
+      if (!item) continue;
 
-          const leadThr = Number(th.LEAD_THR);
-          const leadN = Number(m.lead_max_tail_norm);
-          const leadRaw = Number(m.lead_max_tail);
-          const leadUse = Number.isFinite(leadN) ? leadN : (Number.isFinite(leadRaw) ? leadRaw : NaN);
+      const text = feedbackTextForItem(item);
+      if (!text || seen.has(text)) continue;
 
-          let sevLead = 0.0;
-          if (Number.isFinite(leadUse)) {
-            if (Number.isFinite(leadThr)) {
-              if (leadUse <= leadThr) sevLead = Math.max(0, (leadThr - leadUse));
-            } else {
-              if (leadUse <= 0) sevLead = Math.max(0, -leadUse);
-            }
-          }
-
-          sev = Math.max(sevDist, sevLead);
-          sev = Math.min(1.0, sev);
-        } else {
-          sev = 0.5;
-        }
-
-        const text = feedbackTextForItem(it);
-        if (text) failed.push({ sev, text });
-      }
-
-      // === extra feedback signals (throw_higher / throw_harder) ===
-      const extra = (criteriaObj && criteriaObj.extra_feedback_signals)
-        ? criteriaObj.extra_feedback_signals
-        : {};
-
-      for (const [key, obj] of Object.entries(extra)) {
-        const stu = obj && obj.student ? obj.student : null;
-        const mdl = obj && obj.model ? obj.model : null;
-        if (!stu || stu.passed !== false) continue;
-
-        const sm = stu.metrics || {};
-        const st = stu.thresholds || {};
-        const mm = (mdl && mdl.metrics) ? mdl.metrics : {};
-
-        let sev = 0.0;
-
-        if (key === "throw_higher") {
-          const studentAngle = Number(sm.launch_angle_deg);
-          const modelAngle = Number(mm.launch_angle_deg);
-
-          if (Number.isFinite(studentAngle) && Number.isFinite(modelAngle)) {
-            sev = Math.max(0, (modelAngle - studentAngle) / Math.max(Math.abs(modelAngle), 1));
-          } else if (Number.isFinite(studentAngle)) {
-            sev = Math.max(0, -studentAngle / 15.0);
-          } else {
-            sev = 0.5;
-          }
-        } else if (key === "throw_harder") {
-          const ratio = Number(sm.speed_ratio_vs_model);
-          const thr = Number(st.HARDER_RATIO_THR);
-
-          if (Number.isFinite(ratio) && Number.isFinite(thr) && thr > 1e-9) {
-            sev = Math.max(0, (thr - ratio) / thr);
-          } else {
-            sev = 0.5;
-          }
-        } else {
-          sev = 0.5;
-        }
-
-        sev = Math.min(1.0, sev);
-
-        const text = feedbackTextForExtraSignal(key);
-        if (text) failed.push({ sev, text });
-      }
-
-      failed.sort((a, b) => b.sev - a.sev);
-
-      const out = [];
-      const seen = new Set();
-      for (const f of failed) {
-        if (seen.has(f.text)) continue;
-        seen.add(f.text);
-        out.push(f.text);
-        if (out.length >= maxItems) break;
-      }
-      return out;
+      seen.add(text);
+      out.push(text);
+      if (out.length >= maxItems) return out;
     }
+  }
+
+  // 2) 如果后端没有 severity_ranking，再退回到 student.severity
+  const failedItems = items
+    .filter(it => !(it?.student?.passed))
+    .map((it, idx) => ({
+      idx,
+      sev: Number(it?.student?.severity ?? 0),
+      item: it,
+    }))
+    .sort((a, b) => {
+      if (b.sev !== a.sev) return b.sev - a.sev;
+      return a.idx - b.idx;
+    });
+
+  for (const x of failedItems) {
+    const text = feedbackTextForItem(x.item);
+    if (!text || seen.has(text)) continue;
+
+    seen.add(text);
+    out.push(text);
+    if (out.length >= maxItems) return out;
+  }
+
+  // 3) extra signals 仍然放最后
+  const extra = criteriaObj?.extra_feedback_signals || {};
+  for (const [key, obj] of Object.entries(extra)) {
+    const stu = obj?.student;
+    if (!stu || stu.passed !== false) continue;
+
+    const text = feedbackTextForExtraSignal(key);
+    if (!text || seen.has(text)) continue;
+
+    seen.add(text);
+    out.push(text);
+    if (out.length >= maxItems) return out;
+  }
+
+  return out;
+}
 
       function renderScoreBox(scoreObj, criteriaObj) {
       let percentRaw = scoreObj?.matching_percent;

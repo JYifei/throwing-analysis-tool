@@ -293,6 +293,14 @@ class TennisDetector:
         cooldown_frames_remaining = 0
         ball_frames_in_session = []
         release_detected_by_ratio = False
+
+        # --- only keep the first throw ---
+        ONLY_FIRST_THROW_PER_CLIP = True
+
+        # stop AFTER keeping some post-release frames
+        first_throw_locked = False
+        first_release_frame = None
+        post_release_keep_frames = int(1.0 * fps)   # 出手后再继续处理 1 秒
         
         # Log
         from pathlib import Path
@@ -697,6 +705,18 @@ class TennisDetector:
                                 all_records[-1]["is_rt_release"] = True
                                 print(f"[Frame {frame_count:5d}] Release detected, buffer started")
 
+                                # Temporary mode:
+                                # after the first confirmed release, stop detecting later throws
+                                if ONLY_FIRST_THROW_PER_CLIP:
+                                    first_throw_locked = True
+                                    first_release_frame = frame_count
+
+            # Early exit:
+            # keep some post-release frames, then stop
+            if ONLY_FIRST_THROW_PER_CLIP and first_throw_locked and first_release_frame is not None:
+                if frame_count >= first_release_frame + post_release_keep_frames:
+                    print(f"[INFO] Early stop after buffered post-release frames at frame {frame_count}")
+                    break
         # 视频逐帧读取的 while 循环结束
 
         # === [新增：视频结束时的挂起状态处理 (EOF Fallback)] ===
@@ -893,6 +913,12 @@ class TennisDetector:
             else:
                 events_path = Path(os.path.dirname(output_path)) / "events.json"
 
+            # Temporary mode:
+            # keep only the first throw pair for clip extraction
+            if ONLY_FIRST_THROW_PER_CLIP:
+                throw_start_frames = throw_start_frames[:1]
+                release_frames = release_frames[:1]
+
             print(f"\n[CLIPS] Extracting {len(throw_start_frames)} clips...")
             
             # Re-open video for reading (to jump around)
@@ -908,7 +934,8 @@ class TennisDetector:
 
             
             # Buffer setting: frames after release to keep (e.g., 30 frames ~ 1 sec)
-            post_release_buffer = 10 
+            # Buffer setting: frames after release to keep
+            post_release_buffer = post_release_keep_frames
             
             for i, (ts_idx, rel_idx) in enumerate(zip(throw_start_frames, release_frames)):
                 # Get actual frame numbers from DataFrame

@@ -559,7 +559,7 @@ def crit3_step_forward_with_nonthrow_foot_details(
 
     # Thresholds
     STEP_X_TINY_THR = 0.1
-    STEP_X_THR = 0.5
+    STEP_X_THR = 0.5*2.14
 
     # Wrong-foot heuristic:
     # if the correct foot does not pass, but the wrong foot moves clearly forward,

@@ -26,6 +26,7 @@ from result_logic import (
     score_message,
     collect_ui_like_feedback,
     build_score_obj,
+    annotate_criteria_with_severity,
 )
 
 # -------------------------
@@ -235,6 +236,9 @@ def _ui_like_postprocess_one_job(
             map_csv=str(map_csv),
             model_windows=None,
         )
+
+        criteria_obj = annotate_criteria_with_severity(criteria_obj)
+
         criteria_path.write_text(
             json.dumps(criteria_obj, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -367,6 +371,7 @@ def summarize_all_runs(runs_root: Path, output_csv: str = "batch_summary_report.
                 row[f"{key.upper()}_Reason"] = "" if passed else "; ".join(notes)
 
             # --- 3) 生成 UI-like feedback ---
+            criteria_obj = annotate_criteria_with_severity(criteria_obj)
             ui_feedbacks = collect_ui_like_feedback(criteria_obj, score_float)
             row["Feedback_1"] = ui_feedbacks[0] if len(ui_feedbacks) >= 1 else ""
             row["Feedback_2"] = ui_feedbacks[1] if len(ui_feedbacks) >= 2 else ""

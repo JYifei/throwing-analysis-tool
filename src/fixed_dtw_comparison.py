@@ -106,6 +106,24 @@ class FixedMotionDTW:
         out[:, sl] *= float(factor)
         return out
 
+    def _canonical_joint_flat_slice(self, joint_name: str) -> slice:
+        idx = self.CANONICAL_POSE_NAMES.index(joint_name)
+        return slice(2 * idx, 2 * idx + 2)
+
+    def _apply_canonical_joint_weight(
+        self,
+        pose_mat: np.ndarray,
+        *,
+        joint_name: str,
+        factor: float,
+    ) -> np.ndarray:
+        if pose_mat is None or pose_mat.size == 0:
+            return pose_mat
+        out = np.array(pose_mat, dtype=float, copy=True)
+        sl = self._canonical_joint_flat_slice(joint_name)
+        out[:, sl] *= float(factor)
+        return out
+        
     def _angle_distance_norm(self, x, y) -> float:
         """
         DTW distance for angles (legacy per-feature DTW):
@@ -1017,11 +1035,21 @@ class FixedMotionDTW:
             dominant_side=dom,
             flip_x=flip_student_pose,
         )
-        pose_dtw_norm, pose_path = self._compute_pose_dtw_path(ref_pose, stu_pose)
+
+        # Apply extra DTW weight ONLY for path computation
+        ref_pose_w = self._apply_canonical_joint_weight(
+            ref_pose,
+            joint_name="opp_ankle",
+            factor=self.OPPOSITE_ANKLE_DTW_FACTOR,
+        )
+        stu_pose_w = self._apply_canonical_joint_weight(
+            stu_pose,
+            joint_name="opp_ankle",
+            factor=self.OPPOSITE_ANKLE_DTW_FACTOR,
+        )
+
+        pose_dtw_norm, pose_path = self._compute_pose_dtw_path(ref_pose_w, stu_pose_w)
         map_s_to_m = self._path_to_map_s_to_m(pose_path, n_student=len(student_df))
-        if save_frame_csv and save_align_path:
-            self._save_pose_align_path_csv(student_csv, pose_path)
-            self._save_pose_align_map_csv(student_csv, map_s_to_m)
 
         # Pure coordinate per-frame error
         frame_pose_error = self._compute_frame_pose_error(ref_pose, stu_pose, map_s_to_m)

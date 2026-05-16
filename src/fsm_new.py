@@ -289,7 +289,7 @@ class TennisDetector:
         facing_buffer = deque(maxlen=stand_frames)   # 存最近 stand_frames 的 raw facing
         session_facing = None                        # 一旦standing触发就锁定
         session_throwing_hand = None                 # 跟着session_facing固定
-        buffer_frames = int(0.5 * fps)
+        buffer_frames = int(1 * fps)
         cooldown_frames_remaining = 0
         ball_frames_in_session = []
         release_detected_by_ratio = False
@@ -300,7 +300,8 @@ class TennisDetector:
         # stop AFTER keeping some post-release frames
         first_throw_locked = False
         first_release_frame = None
-        post_release_keep_frames = int(1.0 * fps)   # 出手后再继续处理 1 秒
+        post_release_keep_frames_full = int(1.0 * fps)   # for criteria / follow-through / UI
+        post_release_keep_frames_dtw  = int(0.5 * fps)   # for DTW only
         
         # Log
         from pathlib import Path
@@ -714,7 +715,7 @@ class TennisDetector:
             # Early exit:
             # keep some post-release frames, then stop
             if ONLY_FIRST_THROW_PER_CLIP and first_throw_locked and first_release_frame is not None:
-                if frame_count >= first_release_frame + post_release_keep_frames:
+                if frame_count >= first_release_frame + post_release_keep_frames_full:
                     print(f"[INFO] Early stop after buffered post-release frames at frame {frame_count}")
                     break
         # 视频逐帧读取的 while 循环结束
@@ -935,22 +936,24 @@ class TennisDetector:
             
             # Buffer setting: frames after release to keep (e.g., 30 frames ~ 1 sec)
             # Buffer setting: frames after release to keep
-            post_release_buffer = post_release_keep_frames
+
             
             for i, (ts_idx, rel_idx) in enumerate(zip(throw_start_frames, release_frames)):
                 # Get actual frame numbers from DataFrame
                 start_f = int(df.loc[ts_idx, "frame"])
-                end_f = int(df.loc[rel_idx, "frame"]) + post_release_buffer
-                end_f = min(end_f, total_frames - 1)
-                
-                if start_f >= end_f:
+                release_f = int(df.loc[rel_idx, "frame"])
+
+                end_f_full = min(release_f + post_release_keep_frames_full, total_frames - 1)
+                end_f_dtw  = min(release_f + post_release_keep_frames_dtw,  total_frames - 1)
+
+                if start_f >= end_f_full:
                     throw_id = i + 1
-                    # 这里假设你现在已经有 throw_dir 变量；如果你叫别的名字，就把 throw_dir 换成你的变量
                     events.append({
                         "throw_id": throw_id,
                         "start_frame": int(start_f),
-                        "release_frame": int(df.loc[rel_idx, "frame"]),
-                        "end_frame": int(end_f),
+                        "release_frame": int(release_f),
+                        "end_frame": int(end_f_full),
+                        "dtw_end_frame": int(end_f_dtw),
                         "status": "failed",
                         "reason": "start_frame >= end_frame"
                     })
@@ -967,11 +970,13 @@ class TennisDetector:
                 ev_obj = {
                     "throw_id": throw_id,
                     "start_frame": int(start_f),
-                    "release_frame": int(df.loc[rel_idx, "frame"]),
-                    "end_frame": int(end_f),
+                    "release_frame": int(release_f),
+                    "end_frame": int(end_f_full),                # full clip for criteria/UI
+                    "dtw_end_frame": int(end_f_dtw),             # short clip for DTW
                     "status": "ok",
                     "throw_dir": throw_dir_rel,
                     "clip_csv": str(Path(throw_dir_rel) / "clip.csv"),
+                    "clip_dtw_csv": str(Path(throw_dir_rel) / "clip_dtw.csv"),
                 }
                 if save_clip_video:
                     ev_obj["clip_video"] = str(Path(throw_dir_rel) / "clip.mp4")
@@ -985,7 +990,7 @@ class TennisDetector:
                     clip_h = out_height # Defined earlier (rotated)
                     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                     out_clip = cv2.VideoWriter(clip_path, fourcc, fps, (clip_w, clip_h))
-                    print(f"  -> Saving {clip_name} ({end_f - start_f} frames)")
+                    print(f"  -> Saving {clip_name} ({end_f_full - start_f} frames)")
                 else:
                     print(f"  -> Skip clip.mp4 (save_clip_video=False), only clip.csv saved")
                 
@@ -993,9 +998,15 @@ class TennisDetector:
                 # Filter out DataFrame data for the current segment
                 # Prefer cached full-pose dataframe for exporting clip CSV
                 source_df = df_cache if df_cache is not None else df
-                clip_df = source_df[(source_df['frame'] >= start_f) & (source_df['frame'] <= end_f)].copy()
+                clip_df = source_df[
+                                (source_df['frame'] >= start_f) & (source_df['frame'] <= end_f_full)
+                            ].copy()
 
-                
+
+                clip_dtw_df = source_df[
+                    (source_df['frame'] >= start_f) & (source_df['frame'] <= end_f_dtw)
+                ].copy()
+
                 # Define body joints to save (all body parts, exclude face only)
                 body_joints = [
                     # Main joints (12)
@@ -1050,17 +1061,21 @@ class TennisDetector:
                 csv_name = "clip.csv"
                 csv_path = str(throw_dir / csv_name)
 
-                
-                # Save filtered DataFrame
+                # Save full clip CSV (for criteria / UI / follow-through)
                 clip_df[columns_to_save].to_csv(csv_path, index=False)
                 print(f"     -> Also saved data to {csv_name} ({len(columns_to_save)} columns)")
-                
+
+                # Save shorter CSV for DTW only
+                dtw_csv_name = "clip_dtw.csv"
+                dtw_csv_path = str(throw_dir / dtw_csv_name)
+                clip_dtw_df[columns_to_save].to_csv(dtw_csv_path, index=False)
+                print(f"     -> Also saved data to {dtw_csv_name} ({len(columns_to_save)} columns)")
                 # Jump to start frame
                 if out_clip is not None:
                     # Jump to start frame
                     cap_clip.set(cv2.CAP_PROP_POS_FRAMES, start_f)
 
-                    for f_num in range(start_f, end_f + 1):
+                    for f_num in range(start_f, end_f_full + 1):
                         ret_c, frame_c = cap_clip.read()
                         if not ret_c:
                             break
@@ -1278,10 +1293,14 @@ def _run_dtw_and_write_summary(
         throw_id = t.get("throw_id")
         ev = t
         throw_dir = out_dir_p / ev["throw_dir"]
-        clip_csv = out_dir_p / ev["clip_csv"]
+        clip_dtw_csv_rel = ev.get("clip_dtw_csv")
+        if clip_dtw_csv_rel:
+            clip_csv = out_dir_p / clip_dtw_csv_rel
+        else:
+            clip_csv = out_dir_p / ev["clip_csv"]
+
         score_path = throw_dir / "score.json"
         if not clip_csv.exists():
-            # record as missing but do not crash the whole job
             summary_rows.append({
                 "throw_id": throw_id,
                 "status": "failed",

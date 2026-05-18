@@ -46,9 +46,27 @@ def read_majority_facing(csv_path: str, col: str = "body_facing") -> Optional[st
 
 def load_map_stu_to_ref(map_csv: str) -> np.ndarray:
     df = pd.read_csv(map_csv)
+
+    # New DTW aligned-coordinate file uses "frame" as the student frame index.
+    if "stu_idx" not in df.columns and "frame" in df.columns:
+        df = df.rename(columns={"frame": "stu_idx"})
+
     if "stu_idx" not in df.columns or "ref_idx" not in df.columns:
-        raise ValueError(f"map csv must contain stu_idx/ref_idx, got {df.columns.tolist()}")
-    df = df.sort_values("stu_idx")
+        raise ValueError(
+            f"map csv must contain stu_idx/ref_idx or frame/ref_idx, "
+            f"got {df.columns.tolist()}"
+        )
+
+    df = df[["stu_idx", "ref_idx"]].copy()
+    df["stu_idx"] = pd.to_numeric(df["stu_idx"], errors="coerce")
+    df["ref_idx"] = pd.to_numeric(df["ref_idx"], errors="coerce")
+    df = df.dropna(subset=["stu_idx", "ref_idx"])
+
+    df["stu_idx"] = df["stu_idx"].astype(int)
+    df["ref_idx"] = df["ref_idx"].astype(int)
+
+    df = df.sort_values("stu_idx").drop_duplicates("stu_idx", keep="first")
+
     return df["ref_idx"].astype(int).to_numpy()
 
 def invert_map_ref_to_stu(stu_to_ref: np.ndarray) -> Dict[int, List[int]]:
@@ -453,7 +471,7 @@ def crit2_rotate_nonthrow_side_faces_target_details(
     shoulder_open_gain = float(shoulder_len_norm - baseline_shoulder_len_p25)
 
     # Thresholds
-    SHOULDER_OPEN_GAIN_THR = 0.1
+    SHOULDER_OPEN_GAIN_THR = 0.05
     SHOULDER_LEN_ABS_MIN = 0.35
 
     gain_pass = (shoulder_open_gain >= SHOULDER_OPEN_GAIN_THR)
@@ -1193,7 +1211,12 @@ def evaluate_criteria(
                 "HARDER_RATIO_THR": float(HARDER_RATIO_THR),
             }
             
-            
+    all_main_passed = all(
+    bool(item.get("student", {}).get("passed", False))
+    for item in items
+    )
+
+    hide_extra_feedback = all_main_passed
             
     return {
         "meta": {
@@ -1213,7 +1236,7 @@ def evaluate_criteria(
             },
         },
         "items": items,
-        "extra_feedback_signals": {
+        "extra_feedback_signals": {} if all_main_passed else {
             "throw_higher": {
                 "name": "Throw higher",
                 "student_range": [int(stu_throw_higher_range[0]), int(stu_throw_higher_range[1])] if stu_throw_higher_range else None,
@@ -1227,6 +1250,6 @@ def evaluate_criteria(
                 "model_range": [int(mdl_throw_harder_range[0]), int(mdl_throw_harder_range[1])] if mdl_throw_harder_range else None,
                 "student": pack(stu_throw_harder_dbg),
                 "model": pack(mdl_throw_harder_dbg),
-            }
+            },
         },
     }

@@ -16,26 +16,50 @@ MAIN_JOINTS = [
 
 def read_map_csv(map_csv_path: str) -> np.ndarray:
     """
-    Read stu_idx -> ref_idx mapping.
-    Expected columns: stu_idx, ref_idx
+    Read student-frame -> reference-frame DTW mapping.
 
-    Returns an array map_s_to_m where:
-      map_s_to_m[stu_idx] = ref_idx, or -1 if missing.
+    Preferred columns:
+        stu_idx, ref_idx
+
+    Compatible fallback:
+        frame, ref_idx
+
+    Returns:
+        map_s_to_m[stu_idx] = ref_idx
     """
     df = pd.read_csv(map_csv_path)
+
+    # Newer aligned-coordinate CSV uses "frame" for the student frame index.
+    if "stu_idx" not in df.columns and "frame" in df.columns:
+        df = df.rename(columns={"frame": "stu_idx"})
+
     if "stu_idx" not in df.columns or "ref_idx" not in df.columns:
-        raise ValueError(f"map csv must contain stu_idx/ref_idx, got {df.columns.tolist()}")
+        raise ValueError(
+            f"map csv must contain stu_idx/ref_idx or frame/ref_idx, "
+            f"got {df.columns.tolist()}"
+        )
 
-    df = df.sort_values("stu_idx")
-    stu = df["stu_idx"].astype(int).to_numpy()
-    ref = df["ref_idx"].astype(int).to_numpy()
+    df = df[["stu_idx", "ref_idx"]].copy()
+    df["stu_idx"] = pd.to_numeric(df["stu_idx"], errors="coerce")
+    df["ref_idx"] = pd.to_numeric(df["ref_idx"], errors="coerce")
+    df = df.dropna(subset=["stu_idx", "ref_idx"])
 
-    if len(stu) == 0:
+    df["stu_idx"] = df["stu_idx"].astype(int)
+    df["ref_idx"] = df["ref_idx"].astype(int)
+
+    # If there are repeated student frames, keep the first mapping.
+    df = df.sort_values("stu_idx").drop_duplicates("stu_idx", keep="first")
+
+    if len(df) == 0:
         return np.array([], dtype=int)
+
+    stu = df["stu_idx"].to_numpy()
+    ref = df["ref_idx"].to_numpy()
 
     max_stu = int(stu.max())
     out = np.full((max_stu + 1,), -1, dtype=int)
     out[stu] = ref
+
     return out
 
 
@@ -363,6 +387,7 @@ def render_side_by_side_points(
     green_yellow: float = 0.25,
     yellow_red: float = 0.50,
     point_radius: int = 5,
+    show_pose_points: bool = True,
 ):
     """
     Render side-by-side video:
@@ -464,10 +489,25 @@ def render_side_by_side_points(
             err = float(np.sqrt(dx * dx + dy * dy))
 
             color = _color_from_err(err, green_yellow, yellow_red)
-            #cv2.circle(sf, (int(round(sx)), int(round(sy))), point_radius, color, thickness=-1)
-            
-            # === 修改点 2：使用未缩放的 draw_mx 和 draw_my 画白点 ===
-            #cv2.circle(mf, (int(round(draw_mx)), int(round(draw_my))), point_radius, (200, 200, 200), thickness=-1)
+            if show_pose_points:
+                # Draw DTW joints on student frame.
+                cv2.circle(
+                    sf,
+                    (int(round(sx)), int(round(sy))),
+                    point_radius,
+                    (230, 230, 230),
+                    thickness=-1,
+                )
+
+                # Draw corresponding DTW joints on model frame.
+                # draw_mx/draw_my are still in the original model-crop coordinate space.
+                cv2.circle(
+                    mf,
+                    (int(round(draw_mx)), int(round(draw_my))),
+                    point_radius,
+                    (230, 230, 230),
+                    thickness=-1,
+                )
         # Concatenate and write
         sbs = make_side_by_side(sf, mf, out_h=out_h)
         if sbs is None:

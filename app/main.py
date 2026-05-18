@@ -141,8 +141,9 @@ def create_job(
     video: UploadFile = File(...),
     reference_csv: str = Form(str(DEFAULT_REFERENCE_CSV)),
     thresholds_json: str = Form(str(DEFAULT_THRESHOLDS_JSON)),
-    green_yellow: float = Form(0.25),  # normalized distance
+    green_yellow: float = Form(0.25),
     yellow_red: float = Form(0.50),
+    show_pose_points: bool = Form(False),
 ):
 
     if video.content_type is not None and not video.content_type.startswith("video/"):
@@ -186,8 +187,19 @@ def create_job(
 
                 throw_dir = job_dir / "throws" / throw_id
                 map_csv = throw_dir / "clip_pose_align_map.csv"
+
+                # Compatibility fallback:
+                # newer DTW pipeline may save the alignment result under this name
                 if not map_csv.exists():
-                    continue
+                    alt_map_csv = throw_dir / "clip_dtw_pose_aligned_coords.csv"
+                    if alt_map_csv.exists():
+                        map_csv = alt_map_csv
+                    else:
+                        raise RuntimeError(
+                            f"DTW alignment map missing. Expected either "
+                            f"{throw_dir / 'clip_pose_align_map.csv'} or "
+                            f"{throw_dir / 'clip_dtw_pose_aligned_coords.csv'}"
+                        )
 
                 student_clip = throw_dir / "clip.mp4"
                 stu_csv = throw_dir / "clip.csv"
@@ -258,6 +270,7 @@ def create_job(
                     flip_model=flip_needed,
                     green_yellow=float(green_yellow),
                     yellow_red=float(yellow_red),
+                    show_pose_points=bool(show_pose_points),
                 )
                 ensure_browser_mp4(Path(out_path))
 
@@ -314,8 +327,24 @@ def create_job(
             manifest_path.write_text(json.dumps(manifest_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
         except Exception as e:
-            print(f"[WARN] side-by-side render skipped/failed: {e}")
+            tb = traceback.format_exc()
+            print(f"[ERROR] side-by-side render failed: {e}")
+            print(tb)
 
+            _write_job_status(
+                job_dir,
+                "failed",
+                extra={
+                    "error": f"side-by-side render failed: {e}",
+                    "traceback": tb,
+                    "result": result,
+                },
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"side-by-side render failed: {e}",
+            )
         _write_job_status(job_dir, "done", extra={"result": result})
 
         return JSONResponse(

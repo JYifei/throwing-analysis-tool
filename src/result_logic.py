@@ -333,41 +333,65 @@ def annotate_criteria_with_severity(criteria_obj: Dict[str, Any]) -> Dict[str, A
 
 
 def collect_ui_like_feedback(criteria_obj: Dict[str, Any], matching_percent: float) -> List[str]:
+    """
+    Build UI feedback in this priority order:
+
+    1. Main body-movement criteria c1-c4 first.
+    2. Extra ball-trajectory signals only after c1-c4.
+    3. If c1-c4 all pass, criteria_eval.py should already hide extra signals,
+       so this returns an empty list.
+    """
     limit = feedback_limit_by_score(float(matching_percent))
     if limit <= 0:
         return []
 
     feedbacks: List[str] = []
-    items = criteria_obj.get("items", []) or []
 
-    ranked_failed = []
+    items = criteria_obj.get("items", []) or []
+    main_keys = {"c1", "c2", "c3", "c4"}
+
+    # ---------- 1) Main criteria first ----------
+    ranked_failed_main = []
+
     for idx, item in enumerate(items):
+        key = str(item.get("key", ""))
+        if key not in main_keys:
+            continue
+
         student = item.get("student", {}) or {}
         if bool(student.get("passed", False)):
             continue
 
         sev = _criterion_severity(item)
-        ranked_failed.append((sev, idx, item))
+        ranked_failed_main.append((sev, idx, item))
 
-    # Higher severity first; keep original order as tie-breaker
-    ranked_failed.sort(key=lambda x: (-x[0], x[1]))
+    # Higher severity first; original c1-c4 order as tie-breaker.
+    ranked_failed_main.sort(key=lambda x: (-x[0], x[1]))
 
-    for sev, idx, item in ranked_failed:
+    for sev, idx, item in ranked_failed_main:
         txt = feedback_text_for_item(item)
         if txt and txt not in feedbacks:
             feedbacks.append(txt)
+
         if len(feedbacks) >= limit:
             return feedbacks[:limit]
 
-    # Keep extra signals after the main criteria
+    # ---------- 2) Extra signals after main criteria ----------
     extra = criteria_obj.get("extra_feedback_signals", {}) or {}
+
     if isinstance(extra, dict):
-        for key, value in extra.items():
+        for key in ("throw_higher", "throw_harder"):
+            value = extra.get(key)
+            if value is None:
+                continue
+
             if not _extra_signal_triggered(value):
                 continue
+
             txt = feedback_text_for_extra_signal(str(key))
             if txt and txt not in feedbacks:
                 feedbacks.append(txt)
+
             if len(feedbacks) >= limit:
                 return feedbacks[:limit]
 

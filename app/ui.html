@@ -428,10 +428,28 @@
       const seen = new Set();
 
       const items = Array.isArray(criteriaObj?.items) ? criteriaObj.items : [];
-      const byKey = new Map(items.map(it => [String(it?.key || ""), it]));
+
+      const mainItems = items.filter(it => {
+        const key = String(it?.key || "").toLowerCase();
+        return ["c1", "c2", "c3", "c4"].includes(key);
+      });
+
+      const allMainPassed = mainItems.length > 0 && mainItems.every(it => {
+        const stu = it?.student || {};
+        return stu.passed === true;
+      });
+
+      if (allMainPassed) {
+        return [];
+      }
+
+      const byKey = new Map(mainItems.map(it => [String(it?.key || ""), it]));
 
       const ranking = Array.isArray(criteriaObj?.severity_ranking)
-        ? criteriaObj.severity_ranking
+        ? criteriaObj.severity_ranking.filter(r => {
+            const key = String(r?.key || "").toLowerCase();
+            return ["c1", "c2", "c3", "c4"].includes(key);
+          })
         : [];
 
       if (ranking.length > 0) {
@@ -447,11 +465,12 @@
 
           seen.add(text);
           out.push(text);
+
           if (out.length >= maxItems) return out;
         }
       }
 
-      const failedItems = items
+      const failedItems = mainItems
         .filter(it => !(it?.student?.passed))
         .map((it, idx) => ({
           idx,
@@ -469,19 +488,7 @@
 
         seen.add(text);
         out.push(text);
-        if (out.length >= maxItems) return out;
-      }
 
-      const extra = criteriaObj?.extra_feedback_signals || {};
-      for (const [key, obj] of Object.entries(extra)) {
-        const stu = obj?.student;
-        if (!stu || stu.passed !== false) continue;
-
-        const text = feedbackTextForExtraSignal(key);
-        if (!text || seen.has(text)) continue;
-
-        seen.add(text);
-        out.push(text);
         if (out.length >= maxItems) return out;
       }
 

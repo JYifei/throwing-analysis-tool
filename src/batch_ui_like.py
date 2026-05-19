@@ -276,6 +276,80 @@ def _ui_like_postprocess_one_job(
         encoding="utf-8",
     )
 
+def _postprocess_scores_only(
+    job_dir: Path,
+    *,
+    score_params: Optional[Dict[str, float]] = None,
+) -> None:
+    """
+    Batch-safe score postprocess.
+
+    This does not depend on manifest.json, compare.mp4, criteria.json,
+    or clip_pose_align_map.csv.
+
+    It only reads each throw_*/score.json, extracts the raw DTW overall score,
+    converts it to the same UI-style score object, and writes it back.
+    """
+    if score_params is None:
+        score_params = dict(DEFAULT_SCORE_PARAMS)
+
+    throws_root = job_dir / "throws"
+    if not throws_root.exists():
+        print(f"[WARN] throws folder missing: {throws_root}")
+        return
+
+    for throw_dir in sorted(throws_root.iterdir()):
+        if not throw_dir.is_dir():
+            continue
+
+        score_path = throw_dir / "score.json"
+        if not score_path.exists():
+            print(f"[WARN] score.json missing: {score_path}")
+            continue
+
+        try:
+            score_obj = json.loads(score_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[WARN] failed to read score.json: {score_path}, err={e}")
+            continue
+
+        if not isinstance(score_obj, dict):
+            print(f"[WARN] score.json is not a dict: {score_path}")
+            continue
+
+        # Case 1: already UI-style.
+        if score_obj.get("matching_percent") is not None:
+            continue
+
+        # Case 2: raw DTW is stored under "dtw".
+        dtw_obj = score_obj.get("dtw")
+        if not isinstance(dtw_obj, dict):
+            # Case 3: raw DTW fields may be directly at the top level.
+            dtw_obj = score_obj
+
+        dtw_overall = (
+            dtw_obj.get("overall_matching_score")
+            or score_obj.get("overall_matching_score")
+        )
+
+        if dtw_overall is None:
+            print(f"[WARN] no overall_matching_score found in: {score_path}")
+            continue
+
+        try:
+            ui_score_obj = build_score_obj(float(dtw_overall), **score_params)
+        except Exception as e:
+            print(f"[WARN] failed to build UI score for {score_path}: {e}")
+            continue
+
+        ui_score_obj["dtw"] = dtw_obj
+
+        score_path.write_text(
+            json.dumps(ui_score_obj, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        print(f"[SCORE] updated UI-style score: {score_path}")
 
 def summarize_all_runs(runs_root: Path, output_csv: str = "batch_summary_report.csv") -> None:
     if not runs_root.exists():
@@ -313,11 +387,26 @@ def summarize_all_runs(runs_root: Path, output_csv: str = "batch_summary_report.
                         s_data = json.load(f)
 
                     val = s_data.get("matching_percent")
+
+                    if val is None:
+                        dtw_obj = s_data.get("dtw") if isinstance(s_data.get("dtw"), dict) else s_data
+                        dtw_overall = dtw_obj.get("overall_matching_score") if isinstance(dtw_obj, dict) else None
+
+                        if dtw_overall is not None:
+                            ui_score_obj = build_score_obj(float(dtw_overall), **DEFAULT_SCORE_PARAMS)
+                            val = ui_score_obj.get("matching_percent")
+
                     if val is not None:
                         score_val = str(val)
                         score_float = float(val)
 
                     err = s_data.get("mean_normalized_error")
+                    if err is None and isinstance(s_data.get("dtw"), dict):
+                        err = s_data["dtw"].get("mean_normalized_error")
+
+                    if err is None:
+                        err = s_data.get("overall_matching_score")
+
                     if err is not None:
                         err_val = str(err)
                 except Exception:
@@ -453,16 +542,12 @@ def run_batch(
                 show_realtime=False,
             )
 
-            _ui_like_postprocess_one_job(
+            # For batch scoring, do not depend on UI manifest / compare video / criteria.
+            # The current pipeline already writes score.json inside throws/throw_*.
+            _postprocess_scores_only(
                 job_dir=job_dir,
-                job_id=job_id,
-                reference_csv=reference_csv,
-                thresholds_json=thresholds_json,
-                green_yellow=green_yellow,
-                yellow_red=yellow_red,
                 score_params=score_params,
             )
-
             _write_job_status(job_dir, "done", extra={"result": result})
             print(f"[DONE] job_id={job_id}")
 

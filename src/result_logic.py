@@ -8,9 +8,9 @@ from typing import Any, Dict, List, Optional
 DEFAULT_SCORE_PARAMS = {
     "t1": 0.95,
     "t2": 1.35,
-    "t3": 4.5,
-    "s1": 65.0,
-    "s2": 30.0,
+    "t3": 4.90,
+    "s1": 75.0,
+    "s2": 25.0,
 }
 
 

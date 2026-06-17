@@ -10,7 +10,7 @@ DEFAULT_SCORE_PARAMS = {
     "t2": 1.35,
     "t3": 4.90,
     "s1": 75.0,
-    "s2": 25.0,
+    "s2": 30.0,
 }
 
 
@@ -332,46 +332,92 @@ def annotate_criteria_with_severity(criteria_obj: Dict[str, Any]) -> Dict[str, A
     return criteria_obj
 
 
-def collect_ui_like_feedback(criteria_obj: Dict[str, Any], matching_percent: float) -> List[str]:
+def collect_ui_like_feedback(
+    criteria_obj: Dict[str, Any],
+    matching_percent: float,
+) -> List[str]:
     limit = feedback_limit_by_score(float(matching_percent))
+
     if limit <= 0:
         return []
 
     items = criteria_obj.get("items", []) or []
 
-    # Only main criteria c1-c4 should control the main feedback area.
     main_items = [
-        item for item in items
-        if str(item.get("key", "")).lower() in {"c1", "c2", "c3", "c4"}
+        item
+        for item in items
+        if str(item.get("key", "")).lower()
+        in {"c1", "c2", "c3", "c4"}
     ]
-
-    # If all main criteria pass, show no feedback.
-    all_main_passed = bool(main_items) and all(
-        bool((item.get("student", {}) or {}).get("passed", False))
-        for item in main_items
-    )
-    if all_main_passed:
-        return []
 
     feedbacks: List[str] = []
     ranked_failed = []
 
+    # =================================================
+    # 1. C1-C4 always have priority.
+    # =================================================
     for idx, item in enumerate(main_items):
         student = item.get("student", {}) or {}
+
         if bool(student.get("passed", False)):
             continue
 
-        sev = _criterion_severity(item)
-        ranked_failed.append((sev, idx, item))
+        severity = _criterion_severity(item)
+        ranked_failed.append((severity, idx, item))
 
-    ranked_failed.sort(key=lambda x: (-x[0], x[1]))
+    ranked_failed.sort(
+        key=lambda value: (-value[0], value[1])
+    )
 
-    for sev, idx, item in ranked_failed:
-        txt = feedback_text_for_item(item)
-        if txt and txt not in feedbacks:
-            feedbacks.append(txt)
+    for _, _, item in ranked_failed:
+        text = feedback_text_for_item(item)
 
+        if text and text not in feedbacks:
+            feedbacks.append(text)
+
+        # Main criteria have occupied all available slots.
         if len(feedbacks) >= limit:
             return feedbacks[:limit]
+
+    # =================================================
+    # 2. Extra feedback comes last.
+    # =================================================
+    extra_signals = (
+        criteria_obj.get("extra_feedback_signals", {}) or {}
+    )
+
+    # Order within the lowest-priority group:
+    # Throw higher first, then Throw harder.
+    extra_rules = [
+        ("throw_higher", "throw_higher"),
+        ("throw_harder", "throw_harder"),
+    ]
+
+    for signal_key, required_note in extra_rules:
+        if len(feedbacks) >= limit:
+            break
+
+        signal = extra_signals.get(signal_key, {}) or {}
+        student = signal.get("student", {}) or {}
+
+        notes = {
+            str(note)
+            for note in (student.get("notes", []) or [])
+        }
+
+        # Only show a genuine failed criterion.
+        # Do not show it when the ball data was unavailable.
+        genuinely_failed = (
+            student.get("passed") is False
+            and required_note in notes
+        )
+
+        if not genuinely_failed:
+            continue
+
+        text = feedback_text_for_extra_signal(signal_key)
+
+        if text and text not in feedbacks:
+            feedbacks.append(text)
 
     return feedbacks[:limit]

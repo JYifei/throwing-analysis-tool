@@ -1100,7 +1100,7 @@ def evaluate_criteria(
     
     # ---- extra signal: throw_higher
     # Do NOT put this into items yet, otherwise current frontend will render it.
-    THROW_HIGHER_TAIL_FRAMES = 12
+    THROW_HIGHER_TAIL_FRAMES = 30
 
     stu_throw_higher_range = None
     mdl_throw_higher_range = None
@@ -1138,7 +1138,7 @@ def evaluate_criteria(
 
     # ---- extra signal: throw_harder
     # Do NOT put this into items yet, otherwise current frontend will render it.
-    THROW_HARDER_TAIL_FRAMES = 12
+    THROW_HARDER_TAIL_FRAMES = 30
     HARDER_RATIO_THR = 0.5
 
     stu_throw_harder_range = None
@@ -1216,7 +1216,7 @@ def evaluate_criteria(
     for item in items
     )
 
-    hide_extra_feedback = all_main_passed
+    hide_extra_feedback = False
             
     return {
         "meta": {
@@ -1236,7 +1236,7 @@ def evaluate_criteria(
             },
         },
         "items": items,
-        "extra_feedback_signals": {} if all_main_passed else {
+        "extra_feedback_signals": {
             "throw_higher": {
                 "name": "Throw higher",
                 "student_range": [int(stu_throw_higher_range[0]), int(stu_throw_higher_range[1])] if stu_throw_higher_range else None,
